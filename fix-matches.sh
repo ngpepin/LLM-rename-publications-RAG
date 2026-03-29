@@ -6,7 +6,7 @@
 
 # PURPOSE:
 #
-# Used in conjuntion with / is called by rename-ebooks.sh
+# Used in conjuntion with / is called by rename-using-ebooks-tools.sh
 #
 # - Fixes an issue with ebook-tools where the script creates a directory
 #   for a matching book instead of properly renaming the source file.

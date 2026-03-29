@@ -2,7 +2,7 @@
 # shellcheck disable=SC2086
 # shellcheck disable=SC2034
 #
-# rename-ebooks.sh
+# rename-using-ebooks-tools.sh
 #
 # PURPOSE:
 # This script renames and organizes ebooks in a directory. It uses the Docker image 'didc/ebook-tools:latest' to
@@ -12,7 +12,7 @@
 # See: https://github.com/na--/ebook-tools
 #
 # USAGE:
-# rename-ebooks.sh [-c | --config <config_file>] [-i | --input <input_dir>] [-o | --output <output_dir>] [-f | --fresh] [-d | --debug] [-h | --help]
+# rename-using-ebooks-tools.sh [-c | --config <config_file>] [-i | --input <input_dir>] [-o | --output <output_dir>] [-f | --fresh] [-d | --debug] [-h | --help]
 #
 # Options:
 #   -c, --config        Specify the configuration file
@@ -103,12 +103,13 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 # Change to
-PROJECT_DIR="" # Sourced from rename-ebooks.conf
+PROJECT_DIR="" # Sourced from rename-using-ebooks-tools.conf
 OUTPUT_DIR_DEF=""
+ORIGINALS_SUBDIR="Originals"
 
 # Source the configuration file
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/rename-ebooks.conf"
+source "$SCRIPT_DIR/rename-using-ebooks-tools.conf"
 
 FIX_SCRIPT="$PROJECT_DIR/fix-matches.sh"
 CONFIG_FILE="$PROJECT_DIR/config.json"
@@ -125,6 +126,34 @@ get_config_value() {
     local subkey=$1
     local key="${CURRENT_TREE}${subkey}"
     jq -e -r "$key // \"\"" "$CONFIG_FILE" 2>/dev/null || echo ""
+}
+
+get_unique_path() {
+    local requested_path="$1"
+    local dir_path
+    local filename
+    local extension=""
+    local basename_noext=""
+    local candidate_path=""
+    local counter=1
+
+    dir_path=$(dirname "$requested_path")
+    filename=$(basename "$requested_path")
+
+    if [[ "$filename" == *.* ]]; then
+        extension=".${filename##*.}"
+        basename_noext="${filename%.*}"
+    else
+        basename_noext="$filename"
+    fi
+
+    candidate_path="$requested_path"
+    while [[ -e "$candidate_path" ]]; do
+        candidate_path="$dir_path/${basename_noext}_$counter$extension"
+        counter=$((counter + 1))
+    done
+
+    echo "$candidate_path"
 }
 
 NC='\e[39m'
@@ -547,6 +576,9 @@ if [ "$FAILED_MOUNT_POINT" != "" ] && [ ! -d "$FAILED_DIR" ]; then
     sudo mkdir -p "$FAILED_DIR"
 fi
 
+mapfile -d '' -t ORIGINAL_INPUT_FILES < <(find "$INPUT_DIR" -maxdepth 1 -type f -print0)
+OUTPUT_STAGING_DIR=$(mktemp -d "$OUTPUT_DIR/staging.XXXXXX")
+
 # =====================================================================================================================
 # DOCKER COMMANDS AND OPTIONS
 # ---------------------------------------------------------------------------------------------------------------------
@@ -592,7 +624,7 @@ if [ "$REMOVE_CONTAINER" = "true" ]; then
     DOCKER_CMD+=" --rm"
 fi
 DOCKER_CMD+=" --name $CONTAINER_NAME" # Add the container name
-DOCKER_CMD+=" -v $INPUT_DIR:/$INPUT_MOUNT_POINT -v $OUTPUT_DIR:/$OUTPUT_MOUNT_POINT "
+DOCKER_CMD+=" -v $INPUT_DIR:/$INPUT_MOUNT_POINT -v $OUTPUT_STAGING_DIR:/$OUTPUT_MOUNT_POINT "
 if [ "$CORRUPT_MOUNT_POINT" != "" ]; then
     DOCKER_CMD+=" -v $CORRUPT_DIR:/$CORRUPT_MOUNT_POINT"
 fi
@@ -691,7 +723,8 @@ message "-----------------------------------------------------------------------
 message "Running Docker '$CONTAINER_NAME'"
 message "   Configuration file:    $CONFIG_FILE"
 message "   Input directory:       $INPUT_DIR"
-message "   Output directory:      $OUTPUT_DIR"
+message "   Output staging dir:    $OUTPUT_STAGING_DIR"
+message "   Final renamed dir:     $INPUT_DIR"
 message "   Docker output (tmp):   $DOCKER_OUTPUT_TMP"
 message "   Docker output (final): $DOCKER_OUTPUT"
 message ""
@@ -711,12 +744,42 @@ mv -f "$DOCKER_OUTPUT_TMP" "$DOCKER_OUTPUT" >/dev/null 2>&1
 # ---------------------------------------------------------------------------------------------------------------------
 message "---------------------------------------------------------------------------------------------------------------------" "blue" true
 message "Fixing filenames and directory structures..."
-FIX_CMD="$FIX_SCRIPT $OUTPUT_DIR"
+FIX_CMD="$FIX_SCRIPT $OUTPUT_STAGING_DIR"
 eval "$FIX_CMD" >/dev/null 2>&1
 
 message "---------------------------------------------------------------------------------------------------------------------" "blue" true
-message "Moving files that could not be identified to $FAILED_DIR..."
-find "$SOURCE_DIR" -maxdepth 1 -type f -exec mv {} "$FAILED_DIR/" \; >/dev/null 2>&1
+ORIGINALS_DIR="$INPUT_DIR/$ORIGINALS_SUBDIR"
+mkdir -p "$ORIGINALS_DIR" >/dev/null 2>&1
+
+mapfile -d '' -t STAGED_OUTPUT_FILES < <(find "$OUTPUT_STAGING_DIR" -maxdepth 1 -type f ! -name 'last-run.log' -print0)
+
+if [ ${#STAGED_OUTPUT_FILES[@]} -gt 0 ]; then
+    message "Archiving original files to $ORIGINALS_DIR..." "blue"
+    ARCHIVED_INPUT_FILES=()
+    for original_file in "${ORIGINAL_INPUT_FILES[@]}"; do
+        if [ -f "$original_file" ]; then
+            archived_path=$(get_unique_path "$ORIGINALS_DIR/$(basename "$original_file")")
+            if cp -fp "$original_file" "$archived_path" >/dev/null 2>&1; then
+                ARCHIVED_INPUT_FILES+=("$original_file")
+            fi
+        fi
+    done
+
+    message "Clearing original filenames from $INPUT_DIR..." "blue"
+    for original_file in "${ARCHIVED_INPUT_FILES[@]}"; do
+        rm -f "$original_file" >/dev/null 2>&1
+    done
+
+    message "Moving renamed files back into $INPUT_DIR..." "blue"
+    for staged_file in "${STAGED_OUTPUT_FILES[@]}"; do
+        final_path=$(get_unique_path "$INPUT_DIR/$(basename "$staged_file")")
+        mv -f "$staged_file" "$final_path" >/dev/null 2>&1
+    done
+else
+    message "No renamed files were produced in the staging directory." "yellow"
+fi
+
+rm -rf "$OUTPUT_STAGING_DIR" >/dev/null 2>&1
 message "---------------------------------------------------------------------------------------------------------------------" "blue" false
 
 cd "$RET_DIR" || exit >/dev/null 2>&1

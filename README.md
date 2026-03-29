@@ -1,185 +1,166 @@
-
-# LLM-Augmented Renaming of Publications - Ready for RAG applications
+# LLM-Augmented Renaming of Publications
 
 ## Overview
 
-This project provides two main approaches for renaming and organizing publications:
+This repository helps normalize, rename, and prepare ebook and publication files for downstream indexing or RAG ingestion.
 
-1. **Metadata-Based Renaming**: Uses traditional metadata extraction (title, author, ISBN) via `ebook-tools` and related scripts.
-2. **LLM-Based Renaming**: Uses a Language Model (LLM) API to extract metadata from publication content and generate context-aware filenames, especially for files with poor or missing metadata.
+It supports two main rename flows:
 
-Supported formats: PDF, EPUB, CHM, MOBI.  
+1. `rename-using-llm.sh`
+   Renames files from their content using an LLM API.
+2. `rename-using-ebooks-tools.sh`
+   Uses `ebook-tools` and related scripts for metadata-based renaming.
 
-**We have found this to be very useful for RAG pipelines requiring ingestion of publications (e.g., required for base domain knowledge or reflecting firm-specific research publications) that may contain missing or inconsistent metadata... and where file naming provides little or no insight re: content.**
-
-## RAG-First Positioning and Architecture
-
-This repository is purpose-built to prepare heterogeneous publications for high-quality ingestion into Retrieval-Augmented Generation (RAG) systems. It addresses common blockers—poor filenames, missing metadata, and mixed formats—so downstream chunking, embedding, indexing, and retrieval work reliably.
-
-### Reference Architecture
-
-```mermaid
-flowchart LR
-  A[Raw Publications
-  PDF/EPUB/MOBI/CHM] --> B[Normalize/Convert
-  convert-*.sh]
-  B --> C[Text Extraction
-  pdftotext / ebook-convert]
-  C --> D[LLM Metadata Extraction
-  rename-using-llm]
-  D --> E[Semantic Filenames + Logs
-  Renamed/ & logs/]
-  F[Chunking
-  LangChain/Haystack]
-  F --> G[Embedding
-  OpenAI/Azure/HuggingFace]
-  G --> H[Indexing
-  Vector DB / Azure AI Search]
-  H --> I[Retrieval → Augmentation
-  RAG Runtime]
-```
-
-- **Normalize/Convert:** Standardize formats to PDF where possible using provided `convert-*.sh` scripts for consistent downstream processing.
-- **Text Extraction:** Use `pdftotext` (based on Poppler) and `ebook-convert` (Calibre) to produce robust plaintext.
-- **LLM Metadata Extraction:** Derive semantic metadata (title, author, domain/topic, approximate date, summary) from content, not filesystem metadata.
-- **Semantic Filenames + Logs:** Create collision-free, descriptive filenames and structured logs for auditability and post-processing.
-- **Chunking & Embedding:** Apply windowing strategies (e.g., recursive character text splitter with overlap) and generate embeddings with your chosen model provider.
-- **Indexing & Retrieval:** Store embeddings in a vector index (FAISS, Milvus, pgvector) or Azure AI Search; wire retrieval to your RAG runtime.
-
-### Pipeline Design Notes
-
-- **Chunking Strategy:** Prefer semantic chunking by headings with fallback to character windows (e.g., 1,000–2,000 chars, 10–15% overlap) to balance recall and precision.
-- **Metadata Attachment:** Preserve source path, canonical filename, extracted title/author, and document-level summary for each chunk to improve ranking and answer grounding.
-- **Deduplication:** Use the repo’s hash utilities to avoid duplicate ingestion; maintain a mapping from original → canonical name.
-- **Observability:** Leverage logs in [logs/](logs/) for traceability across ingestion, conversion, and metadata extraction.
-- **Idempotency:** Re-running on the same corpus should be safe; unchanged documents retain canonical names and are skipped.
-
-### Quick Start: Prepare RAG-Ready Corpus
-
-1. Normalize/convert formats as needed:
-   ```bash
-   ./convert-epub-to-pdf.sh /data/publications
-   ./convert-mobi-to-pdf.sh /data/publications
-   ./convert-chm-to-pdf.sh /data/publications
-   ```
-2. Extract semantic metadata and rename:
-   ```bash
-   ./rename-using-llm-langchain.py -i /data/publications -o /data/renamed -c rename-using-llm.conf
-   ```
-3. Organize outputs for ingestion:
-   ```bash
-   ./organize-ebooks.sh -i /data/renamed -o /data/rag-ready
-   ```
-4. Feed into your chunking/embedding/index pipeline (LangChain/Haystack/Azure AI Search).
-
-### Integration Example: LangChain Ingestion
-
-```python
-from pathlib import Path
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import TextLoader, PyPDFLoader
-
-base = Path("/data/renamed")
-docs = []
-for p in base.rglob("*.pdf"):
-   docs.extend(PyPDFLoader(str(p)).load())
-for p in base.rglob("*.txt"):
-   docs.extend(TextLoader(str(p)).load())
-
-splitter = RecursiveCharacterTextSplitter(
-   chunk_size=1500,
-   chunk_overlap=200,
-)
-chunks = splitter.split_documents(docs)
-
-# Attach key metadata fields carried by the repo’s processing
-for d in chunks:
-   d.metadata.setdefault("source", d.metadata.get("source", "unknown"))
-   d.metadata["canonical_filename"] = Path(d.metadata.get("source", "")).name
-
-# Proceed with embeddings + index (FAISS/Milvus/pgvector/Azure)
-```
-
-This positions the repository as a RAG ingestion accelerator: it transforms messy, multi-format publications into semantically labeled, audit-friendly assets ready for chunking, embedding, and retrieval.
-
-### Sidecar Metadata JSON for Indexing
-
-To streamline downstream indexing, generate per-file sidecar JSON with canonical metadata for each publication:
+The preferred end-to-end entry point is:
 
 ```bash
-./generate-sidecar-json.py -i /data/renamed -l logs -o /data/rag-ready/sidecars
+./rename.sh /path/to/books
 ```
 
-Schema (representative):
+That wrapper:
 
-- **source_path:** absolute path of the publication.
-- **canonical_filename:** final filename used for ingestion.
-- **original_filename:** pre-rename basename if available from logs.
-- **file_format / mime_type / size_bytes / sha256:** technical attributes for validation and dedup.
-- **title / author / publication_date:** human metadata (LLM-derived or filename-inferred).
-- **summary / domain_topics:** optional semantic enrichment if present in logs.
-- **llm.model / llm.endpoint / llm.confidence:** provenance of metadata extraction.
-- **metadata_source:** one of `llm`, `filename`, `unknown`.
-- **created_at:** ISO timestamp of sidecar generation.
+1. runs `rename-using-llm.sh`
+2. then converts any remaining non-PDF renamed files to PDF using the conversion scripts in this repo
 
-Sidecars are written next to each file (e.g., `report.pdf.json`) or into `-o` if provided.
+Supported source formats in the main LLM flow: `pdf`, `epub`, `mobi`, `chm`
 
-## Features
+## Current File Behavior
 
-- Scans directories for supported publication files.
-- Extracts text using `pdftotext` or `ebook-convert`.
-- Sends extracted text to an LLM API for metadata extraction.
-- Renames files using the returned metadata, with cleaning and collision avoidance.
-- Converts CHM/MOBI files to PDF if needed.
-- Moves unprocessable files to a "Failed" directory.
-- Logs all actions and errors.
-- Includes error handling and retry logic for API requests.
-- Configuration via `.conf` and `config.json` files.
+The repo no longer writes renamed files into a `Renamed/` subdirectory.
+
+Current behavior for the LLM-based flow:
+
+- renamed files stay in the same directory as the original file
+- the pre-rename source file is copied into a sibling `Originals/` directory
+- files that cannot be processed are moved into `Failed/`
+- `mobi` and `chm` files are converted to PDF as part of the rename step
+
+Current behavior for the conversion scripts:
+
+- converted PDFs are written into the same directory as the source file
+- the source non-PDF file is moved into a `Converted/` subdirectory after successful conversion
+
+Current behavior for `rename-using-ebooks-tools.sh`:
+
+- Docker output is staged temporarily
+- final renamed files are moved back into the input directory
+- original top-level input files are copied into `Originals/`
+
+## Repository Layout
+
+- `rename.sh`
+  Preferred wrapper for LLM rename plus post-rename PDF conversion.
+- `rename-using-llm.sh`
+  Content-based rename flow using an LLM endpoint.
+- `rename-using-ebooks-tools.sh`
+  Metadata-based rename flow using `ebook-tools`.
+- `fix-matches.sh`
+  Repairs the directory structure produced by `ebook-tools`.
+- `convert-epub-to-pdf.sh`
+- `convert-mobi-to-pdf.sh`
+- `convert-chm-to-pdf.sh`
+- `convert-azw3-to-pdf.sh`
+  One-format conversion helpers.
 
 ## Installation
 
-1. Clone the repository:
-   ```sh
+Clone the repository:
 
-   git clone https://github.com/ngpepin/LLM-rename-publications-RAG.git
+```bash
+git clone https://github.com/ngpepin/LLM-rename-publications-RAG.git
+cd rename-ebooks
+```
 
-   cd rename-ebooks
+Install the main dependencies:
 
-   ```
-
-2. Install dependencies:
-   
 - `jq`
 - `docker`
 - `unzip`
 - `poppler-utils`
 - `calibre`
 
+Depending on which scripts you use, you may also need:
+
+- `mobi_unpack`
+- `file`
+
+## Configuration
+
+The main configuration files are:
+
+- `rename-using-llm.conf`
+- `rename-using-ebooks-tools.conf`
+- `config.json`
+
+`rename-using-llm.sh` expects a working API endpoint and model configuration in `rename-using-llm.conf`.
+
 ## Usage
+
+### Preferred Wrapper
+
+```bash
+./rename.sh /path/to/books
+./rename.sh --llm /path/to/books
+./rename.sh --ebook-tools /path/to/books
+```
+
+Use this when you want:
+
+- LLM-based semantic renaming first by default
+- then conversion of renamed `epub`, `mobi`, `chm`, and `azw3` files to PDF
+
+Use `--ebook-tools` if you want the metadata-based rename flow before the same conversion pass.
+
+The wrapper skips `Originals/`, `Failed/`, and `Converted/` directories during its conversion pass.
+
+### LLM-Based Renaming Only
+
+```bash
+./rename-using-llm.sh /path/to/books
+```
+
+Use this when you want semantic renaming without the extra conversion pass performed by `rename.sh`.
 
 ### Metadata-Based Renaming
 
 ```bash
-./rename-ebooks.sh [OPTIONS] -i /path/to/input -o /path/to/output
-```
-### Fixing Matches
-```sh
-./fix-matches.sh [-i /path/to/input-directory -o /path/to/output-directory]
+./rename-using-ebooks-tools.sh -i /path/to/input -o /path/to/output
 ```
 
-### LLM-Based Renaming
+Or, with a single directory argument:
 
 ```bash
-./rename-using-llm.sh /path/to/books
-./rename-using-llm-langchain.py -i /path/to/input -o /path/to/output -c rename-using-llm.conf
+./rename-using-ebooks-tools.sh /path/to/input
 ```
-## Configuration
 
-See `config.json` and `.conf` files for options and API settings.
+In the current implementation, final renamed files are placed back into the input directory and originals are archived into `Originals/`.
 
-## Contributing
+### Individual Conversion Scripts
 
-Contributions are welcome! Please open an issue or submit a pull request.
+```bash
+./convert-epub-to-pdf.sh /path/to/books
+./convert-mobi-to-pdf.sh /path/to/books
+./convert-chm-to-pdf.sh /path/to/books
+./convert-azw3-to-pdf.sh /path/to/books
+```
+
+These scripts operate on files in the specified directory only (`maxdepth 1`).
+
+## RAG-Oriented Workflow
+
+Typical usage looks like this:
+
+1. Normalize and rename source documents.
+   ```bash
+   ./rename.sh /data/publications
+   ```
+2. Feed the resulting PDFs and archived originals into your chunking, embedding, and indexing pipeline.
+
+## Notes
+
+- Re-running the LLM flow is intended to be safe because processed originals are archived and collisions are handled.
+- Conversion scripts create `Converted/` directories only when they successfully move source files out of the working directory.
+- Logs are written under `logs/`.
 
 ## License
 

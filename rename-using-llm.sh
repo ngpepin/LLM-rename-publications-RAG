@@ -43,8 +43,8 @@ LOG_FILE="$PROJ_DIR/logs/rename_books_$$"
 LOG_FILE+="_${CURRENT_TIME}.log" # Log file for storing the output
 MAX_RETRIES=1                    # Maximum number of retries for API requests
 # RETRY_DELAY=4                    # Delay between retries in seconds
-OUTPUT_SUBDIR="Renamed" # Directory to store renamed files
-FAILED_SUBDIR="Failed"  # Directory to store renamed files
+ORIGINALS_SUBDIR="Originals" # Directory to store copies of original files
+FAILED_SUBDIR="Failed"       # Directory to store renamed files
 EXTRACT_SENT_TO_LLM_LENGTH=10000 # Number of lines to extract from the text file for LLM processing
 
 ##### NO CHANGES REQUIRED BELOW THIS LINE #####
@@ -252,11 +252,7 @@ else
     echo "API Connection Successful" | tee -a "$LOG_FILE"
 fi
 
-output_dir="$INPUT_DIR/$OUTPUT_SUBDIR"
-output_dir="${output_dir//\/\//\/}"
-
-mkdir -p "$output_dir" # Create output directory if it doesn't exist
-echo "Output directory: $output_dir" | tee -a "$LOG_FILE"
+echo "Renamed files will remain in place." | tee -a "$LOG_FILE"
 echo "Log file: $LOG_FILE" | tee -a "$LOG_FILE"
 
 failed_dir="$INPUT_DIR/$FAILED_SUBDIR"
@@ -268,11 +264,11 @@ echo "Failed match directory: $failed_dir" | tee -a "$LOG_FILE"
 # Process files
 find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o -name "*.mobi" \) | while IFS= read -r file; do
 
-    # Skip files in Renamed/ subdirectory
+    # Skip files in Originals/ and Failed/ subdirectories
 
     rel_path="${file#$INPUT_DIR}"
     rel_path="${rel_path#/}" # Remove leading slash if present
-    if [[ "$rel_path" != "$OUTPUT_SUBDIR/"* ]] && [[ "$rel_path" != "$FAILED_SUBDIR/"* ]]; then
+    if [[ "/$rel_path" != *"/$ORIGINALS_SUBDIR/"* ]] && [[ "/$rel_path" != *"/$FAILED_SUBDIR/"* ]]; then
 
         ###############
         # The following processes a list of files and attempts to extract text from them for renaming purposes.
@@ -467,23 +463,32 @@ find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o
 
             new_name=$(clean_file_name "$new_name")
             old_file="$file"
-            # old_filepath=$(dirname "$file")
+            old_filepath=$(dirname "$file")
             old_filename=$(basename -- "$file")
+            originals_dir="$old_filepath/$ORIGINALS_SUBDIR"
+            archived_original="$originals_dir/$old_filename"
 
             # Rename (/convert) the file and clean up
             if [[ "$extension" == "chm" ]] || [[ "$extension" == "mobi" ]]; then
 
                 new_filename="${new_name}.pdf"
-                new_path="$output_dir/$new_filename"
+                new_path="$old_filepath/$new_filename"
                 final_path=$(append_index_if_duplicate "$new_path")
                 final_name=$(basename -- "$final_path")
 
                 echo -e "${BGREEN}RENAMING & CONVERTING TO: $final_name.${NC}" | tee -a "$LOG_FILE"
+                mkdir -p "$originals_dir" >>"$LOG_FILE" 2>&1
+                archived_original=$(append_index_if_duplicate "$archived_original")
+                if ! cp -fp "$old_file" "$archived_original" >>"$LOG_FILE" 2>&1; then
+                    echo -e "${BRED}SKIPPING: Failed to archive original file before converting: $old_file.${NC}" | tee -a "$LOG_FILE"
+                    rm -f "$temp_file"
+                    continue
+                fi
                 ebook-convert "$old_file" "$final_path" >>"$LOG_FILE" 2>&1
                 rm -f "$old_file" >>"$LOG_FILE" 2>&1 # delete old .chm file
             else
                 new_filename="${new_name}.${extension}"
-                new_path="$output_dir/$new_filename"
+                new_path="$old_filepath/$new_filename"
                 final_path=$(append_index_if_duplicate "$new_path")
                 final_name=$(basename -- "$final_path")
 
@@ -496,7 +501,16 @@ find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o
                         echo -e "${BGREEN}NAME UNCHANGED; NO RENAMING REQUIRED.${NC}" | tee -a "$LOG_FILE"
                     fi
                 fi
-                mv -f "$old_file" "$final_path" >>"$LOG_FILE" 2>&1
+                mkdir -p "$originals_dir" >>"$LOG_FILE" 2>&1
+                archived_original=$(append_index_if_duplicate "$archived_original")
+                if ! cp -fp "$old_file" "$archived_original" >>"$LOG_FILE" 2>&1; then
+                    echo -e "${BRED}SKIPPING: Failed to archive original file before renaming: $old_file.${NC}" | tee -a "$LOG_FILE"
+                    rm -f "$temp_file"
+                    continue
+                fi
+                if [[ "$old_file" != "$final_path" ]]; then
+                    mv -f "$old_file" "$final_path" >>"$LOG_FILE" 2>&1
+                fi
             fi
         fi
         rm -f "$temp_file"
