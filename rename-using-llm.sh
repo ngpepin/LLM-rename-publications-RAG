@@ -327,16 +327,16 @@ find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o
             continue
         fi
 
-        extracted_text=$(head -n $EXTRACT_SENT_TO_LLM_LENGTH "$temp_file" | tr '"' ' ' | tr "'" " " | tr '\n' ' ' | tr '\r' ' ' | tr '\t' ' ' | tr '\\' ' ' | tr '/' ' ' | tr '$' ' ' | tr '^' ' ') >/dev/null 2>&1
-        extracted_text=$(echo "$extracted_text" | sed "s/’/ /g" | sed 's/[^[:print:]]//g' | str replace "- -" " " | str replace '. . .' ' ' | str replace '....' ' ') >/dev/null 2>&1
-        extracted_text=$(echo "$extracted_text" | tr -c '\40-\176' ' ' | sed 's/  */ /g' | sed 's/  */ /g' | str replace " ... " "." | str replace ": )" " " | str replace ") :" " " | str replace ",," " " | str replace ", . ," " " | str replace ", ," " " | str replace ". ." " " | str replace "  " " " | str replace "  " " " | str replace "  " " ") >/dev/null 2>&1
+        extracted_text=$(head -n $EXTRACT_SENT_TO_LLM_LENGTH "$temp_file" | tr '"' ' ' | tr "'" " " | tr '\n' ' ' | tr '\r' ' ' | tr '\t' ' ' | tr '\\' ' ' | tr '/' ' ' | tr '$' ' ' | tr '^' ' ') 
+        extracted_text=$(echo "$extracted_text" | sed "s/’/ /g" | sed 's/[^[:print:]]//g' | str replace "- -" " " | str replace '. . .' ' ' | str replace '....' ' ') 
+        extracted_text=$(echo "$extracted_text" | tr -c '\40-\176' ' ' | sed 's/  */ /g' | sed 's/  */ /g' | str replace " ... " "." | str replace ": )" " " | str replace ") :" " " | str replace ",," " " | str replace ", . ," " " | str replace ", ," " " | str replace ". ." " " | str replace "  " " " | str replace "  " " " | str replace "  " " ") 
         extracted_text="${extracted_text:0:26000}"
         extracted_text=${extracted_text#\"}
         extracted_text=${extracted_text%\"}
         # echo "Extracted text: $extracted_text"
         new_name=""
         to_skip=true
-        check_blank=$(echo "$extracted_text" | tr -d ' ') >/dev/null 2>&1
+        check_blank=$(echo "$extracted_text" | tr -d ' ') 
         if [ -n "$check_blank" ]; then
 
             for ((retry = 1; retry <= MAX_RETRIES; retry++)); do
@@ -396,7 +396,7 @@ find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o
                 cmd+="}'"
                 echo "Executing command: $cmd" >>"$LOG_FILE"
 
-                temp_response_file=$(mktemp) >/dev/null 2>&1
+                temp_response_file=$(mktemp) 
                 time_start
                 eval "$cmd" >"$temp_response_file"
                 time_stop
