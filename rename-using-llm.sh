@@ -383,7 +383,7 @@ find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o
                 cmd+='-H "Content-Type: application/json" '
                 cmd+="-d '{ \"model\": \"$MODEL\", \"messages\": [{\"role\": \"system\", \"content\": "
                 cmd+="\"You are a metadata extractor. Return ONLY the formatted book details.\""
-                cmd+='},{ "role": "user", "content": "Extract the book title, volume(s), author(s), publication year, and ISBN (if available) from the following text:\n\"'
+                cmd+='},{ "role": "user", "content": "Extract the book title, volume(s), author(s), publication year, and ISBN (if available) from the following text.  Convert accented characters to their closest ASCII equivalents:\n\"'
                 cmd+="$extracted_text"
                 cmd+='\"\nIf you cannot find any of these explicitly, examine the content to see if you can identify the publication by some other means. '
                 cmd+='Return ONLY in this format: \"Title - Author(s) (Year) [ISBN]\". Only return ONE match, the most likely. Do NOT return more than one. '
