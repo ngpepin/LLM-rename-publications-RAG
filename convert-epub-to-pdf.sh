@@ -36,8 +36,22 @@ find "$target_dir" -maxdepth 1 -type f -name "*.epub" -print0 | while IFS= read 
     pdf_path="$target_dir/$filename_noext.pdf"
 
     echo "Converting: $filename to PDF..."
+
+	# check if FoliatePDF.sh is present in the same directory as this script
+	script_dir="$(dirname "$(realpath "$0")")"
+
+	# if it is, use it to convert the epub to pdf, otherwise use ebook-convert
+	if [ -f "$script_dir/FoliatePDF.sh" ]; then
+		"$script_dir/FoliatePDF.sh" --halt-reflowable "$file" -o "$pdf_path"
+		if [ $? -eq 0 ]; then
+			# Move original epub to Converted directory
+			mv "$file" "$converted_dir/"
+			echo "Successfully converted and moved original"
+			continue
+		fi
+	fi
     
-    # Convert epub to pdf
+    # Convert epub to pdf using ebook-convert
     ebook-convert "$file" "$pdf_path"
     
     if [ $? -eq 0 ]; then
