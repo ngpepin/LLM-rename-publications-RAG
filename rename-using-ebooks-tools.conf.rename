@@ -1,0 +1,3 @@
+PROJECT_DIR="/.../rename-ebooks"                    # Replace with the actual path to your project directory
+OUTPUT_DIR_DEF=""
+DOCKERFILE_PATH_DEF="/.../rename-ebooks/Dockerfile" # Replace with the actual path to your Dockerfile
