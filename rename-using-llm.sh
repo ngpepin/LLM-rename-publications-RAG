@@ -5,29 +5,18 @@
 # shellcheck disable=SC2295
 
 #######################################################################################################
-# This script renames eBook files based on their content using a Language Model (LLM) API.
-# It extracts metadata such as title, author, publication year, and ISBN from the content of the books.
-# Supported file formats: PDF and EPUB.
+# Rename ebooks using LLM-extracted metadata.
+#
+# Supported input formats: PDF, EPUB, CHM, MOBI.
 #
 # Dependencies:
-# - jq: For parsing JSON responses from the LLM API.
-# - pdftotext: For extracting text content from PDF files.
-# - ebook-convert: For converting EPUB files to plain text.
-# - str: For string manipulation tasks.
-#
-# Features:
-# - Metadata extraction using LLM API.
-# - Automatic renaming of eBook files based on extracted metadata.
-# - Error handling and retry logic for API requests.
-# - Logging of operations for debugging and tracking.
+# - jq
+# - pdftotext
+# - ebook-convert
+# - python3
 #
 # Usage:
 # ./rename-using-llm.sh /path/to/books
-#
-# Notes:
-# - Ensure all dependencies are installed and available in the system PATH.
-# - The script assumes that the LLM API key and endpoint are configured within the script.
-# - For large collections of books, the script may take time depending on API response times.
 #######################################################################################################
 
 PROJ_DIR=""     # Replaced with project directory sourced from rename-using-llm.conf
@@ -41,15 +30,14 @@ source "$SCRIPT_DIR/rename-using-llm.conf"
 INPUT_DIR="$1" # Directory containing the book files
 LOG_FILE="$PROJ_DIR/logs/rename_books_$$"
 LOG_FILE+="_${CURRENT_TIME}.log" # Log file for storing the output
-MAX_RETRIES=1                    # Maximum number of retries for API requests
-# RETRY_DELAY=4                    # Delay between retries in seconds
+: "${API_TIMEOUT_SECONDS:=60}"         # Timeout for each API call
+: "${API_RETRY_DELAY_SECONDS:=2}"      # Delay before retrying transient API failures
+: "${MAX_INVALID_RESPONSE_RETRIES:=3}" # Invalid model responses before clear failure
 ORIGINALS_SUBDIR="Originals" # Directory to store copies of original files
 FAILED_SUBDIR="Failed"       # Directory to store renamed files
 EXTRACT_SENT_TO_LLM_LENGTH=10000 # Number of lines to extract from the text file for LLM processing
 
-##### NO CHANGES REQUIRED BELOW THIS LINE #####
-
-# capture current date time as YYYMMDDHHMMSS
+# Capture current date-time as YYYYMMDDHHMMSS.
 CURRENT_TIME=$(date +"%Y%m%d%H%M%S")
 
 # Colours
@@ -130,33 +118,46 @@ time_stop() {
 }
 
 ###############
-# This script defines a function `clean_file_name` that processes and cleans up a given file name.
-# The function performs the following operations:
-# 1. Removes the prefix "Title -" or "Title-" from the file name.
-# 2. Replaces newline characters with spaces.
-# 3. Trims leading and trailing spaces from the file name.
-# 4. Removes leading and trailing double quotes from the file name.
-# 5. Replaces double quotes (`"`) within the file name with spaces.
-# 6. Replaces occurrences of double asterisks (`**`) with spaces.
-# 7. Collapses multiple spaces into a single space.
-# 8. Ensures no leading or trailing double quotes remain after processing.
-# The cleaned file name is then echoed as the output of the function.
+# Normalize a candidate filename produced by the model.
+#
+# Steps:
+# 1. Remove leading "Title -" wrappers.
+# 2. Normalize whitespace.
+# 3. Repair legacy "word s word" possessive artifacts.
+# 4. Convert straight quotes/apostrophes via scripts/clean_quotes.py.
+# 5. Collapse repeated asterisks/spaces and trim outer quotes.
 ###############
 
 clean_file_name() {
     # Function to clean the name by removing unwanted characters
-    local new_name="$1"
-    new_name="${new_name#Title -}"
+    local input="$1"
+    local new_name
+    new_name="${input#Title -}"
     new_name="${new_name#Title-}"
     new_name=$(echo "$new_name" | tr '\n' ' ')
     new_name=$(echo "$new_name" | sed 's/^ *//; s/ *$//')
-    new_name=$(echo "$new_name" | sed 's/^"//; s/"$//')
-    new_name=$(echo "$new_name" | str replace '"' ' ')
-    new_name=$(echo "$new_name" | str replace '**' ' ' | str replace '**' ' ')
-    new_name=$(echo "$new_name" | str replace '  ' ' ' | str replace '  ' ' ')
-    new_name=${new_name#\"}
-    new_name=${new_name%\"}
-    echo "$new_name"
+    # Legacy fix: convert "word s word" to "word's word" (artifact from old rename logic).
+    new_name=$(echo "$new_name" | sed -E "s/([[:alpha:]][[:alpha:]]+) s ([[:alpha:]])/\\1's \\2/g")
+
+    # Use helper script for quote normalization
+    local after_py
+    after_py=$(printf '%s' "$new_name" | python3 "$SCRIPT_DIR/scripts/clean_quotes.py" 2>/dev/null || true)
+    if [ -z "$after_py" ]; then
+        after_py="$new_name"
+    fi
+
+    # Replace '**' with spaces and collapse repeated spaces.
+    local tmp
+    tmp=$(echo "$after_py" | sed -e 's/\*\*/ /g' -e 's/  */ /g')
+    tmp=${tmp#\"}
+    tmp=${tmp%\"}
+    echo "$tmp"
+}
+
+fix_legacy_possessive_filename() {
+    # Convert legacy "word s word" patterns into possessive form.
+    local stem="$1"
+    echo "$stem" | sed -E "s/([[:alpha:]][[:alpha:]]+) s ([[:alpha:]])/\\1's \\2/g"
 }
 
 ###############
@@ -262,7 +263,7 @@ mkdir -p "$failed_dir" # Create failed directory if it doesn't exist
 echo "Failed match directory: $failed_dir" | tee -a "$LOG_FILE"
 
 # Process files
-find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o -name "*.mobi" \) | while IFS= read -r file; do
+find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm" -o -iname "*.mobi" \) | while IFS= read -r file; do
 
     # Skip files in Originals/ and Failed/ subdirectories
 
@@ -302,7 +303,25 @@ find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o
         echo "Processing: $file" | tee -a "$LOG_FILE"
 
         filename=$(basename -- "$file")
+        # If legacy renaming left " s " where possessive should be, correct filename first.
+        local_stem="${filename%.*}"
+        fixed_stem=$(fix_legacy_possessive_filename "$local_stem")
+        if [[ "$fixed_stem" != "$local_stem" ]]; then
+            old_filepath=$(dirname "$file")
+            original_ext="${filename##*.}"
+            corrected_path="$old_filepath/${fixed_stem}.${original_ext}"
+            corrected_path=$(append_index_if_duplicate "$corrected_path")
+            corrected_name=$(basename -- "$corrected_path")
+            echo -e "${BGREEN}CORRECTING LEGACY POSSESSIVE: $filename -> $corrected_name.${NC}" | tee -a "$LOG_FILE"
+            if [[ "$file" != "$corrected_path" ]]; then
+                mv -f "$file" "$corrected_path" >>"$LOG_FILE" 2>&1
+            fi
+            file="$corrected_path"
+            filename=$(basename -- "$file")
+        fi
+
         extension="${filename##*.}"
+        extension="${extension,,}"
         # filename_noext="${filename%.*}"
 
         # Convert file to plain text
@@ -327,26 +346,29 @@ find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o
             continue
         fi
 
-        extracted_text=$(head -n $EXTRACT_SENT_TO_LLM_LENGTH "$temp_file" | tr '"' ' ' | tr "'" " " | tr '\n' ' ' | tr '\r' ' ' | tr '\t' ' ' | tr '\\' ' ' | tr '/' ' ' | tr '$' ' ' | tr '^' ' ') 
-        extracted_text=$(echo "$extracted_text" | sed "s/’/ /g" | sed 's/[^[:print:]]//g' | str replace "- -" " " | str replace '. . .' ' ' | str replace '....' ' ') 
-        extracted_text=$(echo "$extracted_text" | tr -c '\40-\176' ' ' | sed 's/  */ /g' | sed 's/  */ /g' | str replace " ... " "." | str replace ": )" " " | str replace ") :" " " | str replace ",," " " | str replace ", . ," " " | str replace ", ," " " | str replace ". ." " " | str replace "  " " " | str replace "  " " " | str replace "  " " ") 
+    proc_txt=$(mktemp)
+    head -n $EXTRACT_SENT_TO_LLM_LENGTH "$temp_file" | python3 "$SCRIPT_DIR/scripts/clean_quotes.py" > "$proc_txt"
+
+    extracted_text=$(cat "$proc_txt" | tr '\n' ' ' | tr '\r' ' ' | tr '\t' ' ' | tr '\\' ' ' | tr '/' ' ' | tr '$' ' ' | tr '^' ' ')
+    rm -f "$proc_txt"
+        extracted_text=$(echo "$extracted_text" | sed -e 's/[^[:print:]]//g' -e 's/- -/ /g' -e 's/\. \. \./ /g' -e 's/\.\.\.\./ /g')
+        extracted_text=$(echo "$extracted_text" | sed -e 's/  */ /g' -e 's/ \.\.\. /./g' -e 's/: )/ /g' -e 's/) :/ /g' -e 's/,,/ /g' -e 's/, \. ,/ /g' -e 's/, ,/ /g' -e 's/\. \./ /g' -e 's/  */ /g')
         extracted_text="${extracted_text:0:26000}"
-        extracted_text=${extracted_text#\"}
-        extracted_text=${extracted_text%\"}
         # echo "Extracted text: $extracted_text"
         new_name=""
         to_skip=true
         check_blank=$(echo "$extracted_text" | tr -d ' ') 
         if [ -n "$check_blank" ]; then
 
-            for ((retry = 1; retry <= MAX_RETRIES; retry++)); do
+            retry=1
+            invalid_response_retries=0
+            while true; do
 
                 ###############
                 # The following interacts with an API (OpenAI API based model) to extract and format metadata
                 # for eBooks based on provided text. The script performs the following steps:
                 #
                 # 1. Constructs a cURL command to send a POST request to the API endpoint.
-                #    - The request includes a JSON payload specifying the model, system instructions, and user prompt.
                 #    - The system instructions define the role of the model as a metadata extractor.
                 #    - The user prompt provides the text to analyze and specifies the desired output format.
                 #
@@ -378,62 +400,86 @@ find "$INPUT_DIR" -type f \( -name "*.pdf" -o -name "*.epub" -o -name "*.chm" -o
                 # - The API response is expected to be in JSON format, and the metadata is extracted from the "content" field.
                 ###############
 
-                cmd='curl -s -X POST '
-                cmd+="$API_ENDPOINT "
-                cmd+='-H "Content-Type: application/json" '
-                cmd+="-d '{ \"model\": \"$MODEL\", \"messages\": [{\"role\": \"system\", \"content\": "
-                cmd+="\"You are a metadata extractor. Return ONLY the formatted book details.\""
-                cmd+='},{ "role": "user", "content": "Extract the book title, volume(s), author(s), publication year, and ISBN (if available) from the following text.  Convert accented characters to their closest ASCII equivalents:\n\"'
-                cmd+="$extracted_text"
-                cmd+='\"\nIf you cannot find any of these explicitly, examine the content to see if you can identify the publication by some other means. '
-                cmd+='Return ONLY in this format: \"Title - Author(s) (Year) [ISBN]\". Only return ONE match, the most likely. Do NOT return more than one. '
-                cmd+='If you are unsure then return NA. If you do not obtain an ISBN by inspecting this text extract, please perform a web lookup '
-                cmd+='to try to determine it indirectly from other sources. If the information is not in English, French or Spanish, please perform a translation into English. '
-				cmd+='Pay special attention to volume numbers (if any), being sure to include the specific volume number of a series in the title. Do not return all volume names, just the one you have identified. '
-				cmd+='If the book has more than three authors, only return the first three followed by et al. '
-				cmd+='Please ensure that you return only characters that are legal in a Linux filename. "'
-                cmd+='}], "temperature": 0.3, "max_tokens": 90000 '
-                cmd+="}'"
-                echo "Executing command: $cmd" >>"$LOG_FILE"
+                # Build payload with jq instead of shell-escaped eval to avoid quoting errors.
+                user_prompt="Extract the book title, volume(s), author(s), publication year, and ISBN (if available) from the following text.  Convert accented characters to their closest ASCII equivalents:\n\n${extracted_text}\n\nIf you cannot find any of these explicitly, examine the content to see if you can identify the publication by some other means. Return ONLY in this format: \"Title - Author(s) (Year) [ISBN]\". Only return ONE match, the most likely. Do NOT return more than one. If you are unsure then return NA. If you do not obtain an ISBN by inspecting this text extract, please perform a web lookup to try to determine it indirectly from other sources. If the information is not in English, French or Spanish, please perform a translation into English. Pay special attention to volume numbers (if any), being sure to include the specific volume number of a series in the title. Do not return all volume names, just the one you have identified. If the book has more than three authors, only return the first three followed by et al. Please ensure that you return only characters that are legal in a Linux filename."
 
-                temp_response_file=$(mktemp) 
+                payload_file=$(mktemp)
+                jq -n --arg model "$MODEL" \
+                    --arg system "You are a metadata extractor. Return ONLY the formatted book details." \
+                    --arg user "$user_prompt" \
+                    '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], temperature:0.3, max_tokens:90000}' > "$payload_file"
+
+                echo "Executing curl with payload in $payload_file" >>"$LOG_FILE"
+
+                temp_response_file=$(mktemp)
                 time_start
-                eval "$cmd" >"$temp_response_file"
+                curl_exit=0
+                http_code=$(curl -sS --max-time "$API_TIMEOUT_SECONDS" -X POST "$API_ENDPOINT" -H "Content-Type: application/json" -d @"$payload_file" -o "$temp_response_file" -w "%{http_code}" 2>>"$LOG_FILE") || curl_exit=$?
                 time_stop
+                rm -f "$payload_file"
+
+                if ((curl_exit != 0)); then
+                    echo -e "${BRED}API call failed/timed out on attempt $retry (curl exit $curl_exit). Retrying in ${API_RETRY_DELAY_SECONDS}s.${NC}" >>"$LOG_FILE"
+                    rm -f "$temp_response_file" >/dev/null 2>&1
+                    ((retry++))
+                    sleep "$API_RETRY_DELAY_SECONDS"
+                    continue
+                fi
 
                 LLM_RESPONSE="$(cat "$temp_response_file" | tr -c '\40-\176' ' ')"
-                rm -f "$temp_response_file" >/dev/null 2>&1
 
                 # Log the response
+                echo "API HTTP status (Attempt $retry): $http_code" >>"$LOG_FILE"
                 echo "API Response (Attempt $retry): $LLM_RESPONSE" >>"$LOG_FILE"
-                # Check for errors in the API response
-                if [[ "$LLM_RESPONSE" == *"error"* ]]; then
-                    echo -e "${BRED}SKIPPING: API Error on attempt $retry: $LLM_RESPONSE.${NC}" >>"$LOG_FILE"
-                    # mv -f "$file" "$failed_dir/$file" >>"$LOG_FILE" 2>&1
-                    # sleep $RETRY_DELAY
-                else
-                    # Parse the response
-                    new_name=$(echo "$LLM_RESPONSE" | jq -r '.choices[0].message.content')
-                    new_name=$(clean_file_name "$new_name")
-                    echo "Parsed name: $new_name" >>"$LOG_FILE"
-                    if good_response "$new_name"; then
-                        to_skip=false
-                        break
-                    else
-                        # Try to extract the portion between "content":"\" and \", using sed
-                        new_name=$(echo "$LLM_RESPONSE" | sed -n 's/.*"content":"\\"\(.*\)\\"".*/\1/p')
-                        new_name=$(clean_file_name "$new_name")
-                        echo "Sed output: $new_name" >>"$LOG_FILE"
-                        if good_response "$new_name"; then
-                            to_skip=false
-                            break
-                            #else
-                            #echo -e "${BRED}SKIPPING: Invalid response on attempt $retry.${NC}" >>"$LOG_FILE"
-                        #    sleep $RETRY_DELAY
-                        fi
 
-                    fi
+                if [[ "$http_code" =~ ^(400|401|403|404|422)$ ]]; then
+                    echo -e "${BRED}SKIPPING: Clear API failure (HTTP $http_code) on attempt $retry.${NC}" >>"$LOG_FILE"
+                    rm -f "$temp_response_file" >/dev/null 2>&1
+                    break
                 fi
+
+                if [[ "$http_code" != "200" ]]; then
+                    echo -e "${BRED}Transient API HTTP $http_code on attempt $retry. Retrying in ${API_RETRY_DELAY_SECONDS}s.${NC}" >>"$LOG_FILE"
+                    rm -f "$temp_response_file" >/dev/null 2>&1
+                    ((retry++))
+                    sleep "$API_RETRY_DELAY_SECONDS"
+                    continue
+                fi
+
+                if jq -e '.error' "$temp_response_file" >/dev/null 2>&1; then
+                    echo -e "${BRED}SKIPPING: Clear API error payload on attempt $retry: $LLM_RESPONSE.${NC}" >>"$LOG_FILE"
+                    rm -f "$temp_response_file" >/dev/null 2>&1
+                    break
+                fi
+
+                # Parse model output
+                new_name=$(jq -r '.choices[0].message.content // empty' "$temp_response_file" 2>/dev/null)
+                rm -f "$temp_response_file" >/dev/null 2>&1
+                new_name=$(clean_file_name "$new_name")
+                echo "Parsed name: $new_name" >>"$LOG_FILE"
+                if good_response "$new_name"; then
+                    to_skip=false
+                    break
+                fi
+
+                # Fallback extraction for non-standard payloads
+                new_name=$(echo "$LLM_RESPONSE" | sed -n 's/.*"content":"\\"\(.*\)\\"".*/\1/p')
+                new_name=$(clean_file_name "$new_name")
+                echo "Sed output: $new_name" >>"$LOG_FILE"
+                if good_response "$new_name"; then
+                    to_skip=false
+                    break
+                fi
+
+                ((invalid_response_retries++))
+                if ((invalid_response_retries >= MAX_INVALID_RESPONSE_RETRIES)); then
+                    echo -e "${BRED}SKIPPING: Clear failure after $invalid_response_retries invalid model responses.${NC}" >>"$LOG_FILE"
+                    break
+                fi
+
+                echo "Invalid model response on attempt $retry. Retrying in ${API_RETRY_DELAY_SECONDS}s." >>"$LOG_FILE"
+                ((retry++))
+                sleep "$API_RETRY_DELAY_SECONDS"
             done
         fi
 
