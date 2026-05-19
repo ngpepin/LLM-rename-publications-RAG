@@ -12,7 +12,7 @@ This repository is primarily a shell-script codebase for renaming and converting
   renamed files stay in place
   originals are archived into `Originals/`
   failed files go to `Failed/`
-  successful format conversions archive sources into `Converted/`
+  successful conversion-helper runs archive sources into `Converted/`
 - Do not reintroduce the old `Renamed/` output model unless explicitly requested.
 
 ## Important Entry Points
@@ -23,6 +23,8 @@ This repository is primarily a shell-script codebase for renaming and converting
   Primary LLM-based rename flow.
 - `rename-using-ebooks-tools.sh`
   Metadata-based rename flow using `ebook-tools`.
+- `prefix-by-year.sh`
+  Utility to prefix filenames with `YYYY - `, or `____ - ` when no year is found.
 - `fix-matches.sh`
   Post-processes `ebook-tools` output.
 - `convert-*-to-pdf.sh`

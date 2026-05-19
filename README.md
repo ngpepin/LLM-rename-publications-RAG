@@ -20,7 +20,7 @@ The preferred end-to-end entry point is:
 That wrapper:
 
 1. runs `rename-using-llm.sh`
-2. then converts any remaining non-PDF renamed files to PDF using the conversion scripts in this repo
+2. then converts any remaining non-PDF files to PDF using the conversion scripts in this repo
 
 Supported source formats in the main LLM flow: `pdf`, `epub`, `mobi`, `chm`
 
@@ -54,6 +54,8 @@ Current behavior for `rename-using-ebooks-tools.sh`:
   Content-based rename flow using an LLM endpoint.
 - `rename-using-ebooks-tools.sh`
   Metadata-based rename flow using `ebook-tools`.
+- `prefix-by-year.sh`
+  Utility that prefixes files with `YYYY - ` when a year is found, or `____ - ` when no year is found.
 - `fix-matches.sh`
   Repairs the directory structure produced by `ebook-tools`.
 - `convert-epub-to-pdf.sh`
@@ -146,6 +148,20 @@ In the current implementation, final renamed files are placed back into the inpu
 
 These scripts operate on files in the specified directory only (`maxdepth 1`).
 
+### Prefix Existing Files By Year
+
+```bash
+./prefix-by-year.sh /path/to/books
+./prefix-by-year.sh --dry-run /path/to/books
+```
+
+Behavior:
+
+- skips files already prefixed as `YYYY - ` or `____ - `
+- prefixes with `YYYY - ` when a valid year in the configured range is found
+- prefixes with `____ - ` when no year is found
+- avoids filename-length failures by truncating safely when needed
+
 ## RAG-Oriented Workflow
 
 Typical usage looks like this:
@@ -161,6 +177,7 @@ Typical usage looks like this:
 - Re-running the LLM flow is intended to be safe because processed originals are archived and collisions are handled.
 - Conversion scripts create `Converted/` directories only when they successfully move source files out of the working directory.
 - Logs are written under `logs/`.
+- Canonical script entrypoints are the `.sh` files; extensionless symlink aliases are local convenience only.
 
 ## License
 
