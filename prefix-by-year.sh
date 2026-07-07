@@ -13,8 +13,8 @@ set -euo pipefail
 # If no year is found, the script prefixes "____ - " instead.
 
 # Configure valid year range (inclusive). Update these to change behavior.
-MIN_YEAR=1900
-MAX_YEAR=2026
+MIN_YEAR=1940
+MAX_YEAR=2040
 
 # Most Linux filesystems cap a single path component at 255 bytes.
 DEFAULT_NAME_MAX=255
