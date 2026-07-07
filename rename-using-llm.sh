@@ -22,6 +22,7 @@
 PROJ_DIR=""     # Replaced with project directory sourced from rename-using-llm.conf
 API_ENDPOINT="" # Replaced with API endpoint sourced from rename-using-llm.conf
 MODEL=""        # Model to use for LLM API requests, e.g., gpt-4o (may need to use gpt-4)
+API_KEY=""      # API key sourced from rename-using-llm.conf
 
 # Source the configuration file
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -238,6 +239,7 @@ echo "API Endpoint: $API_ENDPOINT" >>"$LOG_FILE"
 echo "Testing API connection..." | tee -a "$LOG_FILE"
 TEST_RESPONSE=$(curl -s -X POST "$API_ENDPOINT" \
     -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $API_KEY" \
     -d '{
         "model": "'"$MODEL"'",
         "messages": [
@@ -357,7 +359,7 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
         # echo "Extracted text: $extracted_text"
         new_name=""
         to_skip=true
-        check_blank=$(echo "$extracted_text" | tr -d ' ') 
+        check_blank=$(echo "$extracted_text" | tr -d ' ')
         if [ -n "$check_blank" ]; then
 
             retry=1
@@ -414,7 +416,12 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 temp_response_file=$(mktemp)
                 time_start
                 curl_exit=0
-                http_code=$(curl -sS --max-time "$API_TIMEOUT_SECONDS" -X POST "$API_ENDPOINT" -H "Content-Type: application/json" -d @"$payload_file" -o "$temp_response_file" -w "%{http_code}" 2>>"$LOG_FILE") || curl_exit=$?
+                http_code=$(curl -sS --max-time "$API_TIMEOUT_SECONDS" -X POST "$API_ENDPOINT" \
+                    -H "Content-Type: application/json" \
+                    -H "Authorization: Bearer $API_KEY" \
+                    -d @"$payload_file" \
+                    -o "$temp_response_file" \
+                    -w "%{http_code}" 2>>"$LOG_FILE") || curl_exit=$?
                 time_stop
                 rm -f "$payload_file"
 
