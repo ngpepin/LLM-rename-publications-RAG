@@ -31,7 +31,7 @@ source "$SCRIPT_DIR/rename-using-llm.conf"
 INPUT_DIR="$1" # Directory containing the book files
 LOG_FILE="$PROJ_DIR/logs/rename_books_$$"
 LOG_FILE+="_${CURRENT_TIME}.log" # Log file for storing the output
-: "${API_TIMEOUT_SECONDS:=60}"         # Timeout for each API call
+: "${API_TIMEOUT_SECONDS:=360}"         # Timeout for each API call
 : "${API_RETRY_DELAY_SECONDS:=2}"      # Delay before retrying transient API failures
 : "${MAX_INVALID_RESPONSE_RETRIES:=3}" # Invalid model responses before clear failure
 ORIGINALS_SUBDIR="Originals" # Directory to store copies of original files
