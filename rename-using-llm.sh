@@ -126,33 +126,55 @@ time_stop() {
 # 2. Normalize whitespace.
 # 3. Repair legacy "word s word" possessive artifacts.
 # 4. Convert straight quotes/apostrophes via scripts/clean_quotes.py.
-# 5. Collapse repeated asterisks/spaces and trim outer quotes.
+# 5. Collapse repeated asterisks/spaces, remove surrounding quotes, and strip invalid filename bytes.
 ###############
 
 clean_file_name() {
-    # Function to clean the name by removing unwanted characters
+    # Clean and validate a filename suggested by the model.
     local input="$1"
     local new_name
     new_name="${input#Title -}"
     new_name="${new_name#Title-}"
-    new_name=$(echo "$new_name" | tr '\n' ' ')
-    new_name=$(echo "$new_name" | sed 's/^ *//; s/ *$//')
-    # Legacy fix: convert "word s word" to "word's word" (artifact from old rename logic).
-    new_name=$(echo "$new_name" | sed -E "s/([[:alpha:]][[:alpha:]]+) s ([[:alpha:]])/\\1's \\2/g")
 
-    # Use helper script for quote normalization
+    # Normalize line breaks/tabs to spaces and trim surrounding whitespace.
+    new_name=$(printf '%s' "$new_name" | tr '\n\r\t' '   ')
+    new_name=$(printf '%s' "$new_name" | sed 's/^ *//; s/ *$//')
+
+    # Legacy fix: convert "word s word" to "word's word" (artifact from old rename logic).
+    new_name=$(printf '%s' "$new_name" | sed -E "s/([[:alpha:]][[:alpha:]]+) s ([[:alpha:]])/\\1's \\2/g")
+
+    # Use helper script for quote normalization.
     local after_py
     after_py=$(printf '%s' "$new_name" | python3 "$SCRIPT_DIR/scripts/clean_quotes.py" 2>/dev/null || true)
     if [ -z "$after_py" ]; then
         after_py="$new_name"
     fi
 
-    # Replace '**' with spaces and collapse repeated spaces.
+    # Replace '**' with spaces, collapse repeated spaces, and trim again.
     local tmp
-    tmp=$(echo "$after_py" | sed -e 's/\*\*/ /g' -e 's/  */ /g')
-    tmp=${tmp#\"}
-    tmp=${tmp%\"}
-    echo "$tmp"
+    tmp=$(printf '%s' "$after_py" | sed -e 's/\*\*/ /g' -e 's/  */ /g' -e 's/^ *//' -e 's/ *$//')
+
+    # Strip matching straight or curly quotes only when they surround the whole name.
+    while true; do
+        case "$tmp" in
+            \"*\") tmp="${tmp#\"}"; tmp="${tmp%\"}" ;;
+            “*”) tmp="${tmp#“}"; tmp="${tmp%”}" ;;
+            ‘*’) tmp="${tmp#‘}"; tmp="${tmp%’}" ;;
+            *) break ;;
+        esac
+        tmp=$(printf '%s' "$tmp" | sed -e 's/^ *//' -e 's/ *$//')
+    done
+
+    # Linux filename components cannot contain '/'. Bash variables cannot contain NUL.
+    # Also remove ASCII control characters so invisible output cannot become a filename.
+    tmp=$(printf '%s' "$tmp" | LC_ALL=C tr -d '/\001-\037\177')
+
+    # '.' and '..' are special path components, not usable output filenames.
+    if [[ "$tmp" == "." || "$tmp" == ".." ]]; then
+        tmp=""
+    fi
+
+    printf '%s\n' "$tmp"
 }
 
 fix_legacy_possessive_filename() {
