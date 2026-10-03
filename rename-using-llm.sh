@@ -36,7 +36,11 @@ LOG_FILE+="_${CURRENT_TIME}.log" # Log file for storing the output
 : "${MAX_INVALID_RESPONSE_RETRIES:=3}" # Invalid model responses before clear failure
 ORIGINALS_SUBDIR="Originals" # Directory to store copies of original files
 FAILED_SUBDIR="Failed"       # Directory to store renamed files
-EXTRACT_SENT_TO_LLM_LENGTH=10000 # Number of lines to extract from the text file for LLM processing
+EXTRACT_SENT_TO_LLM_LENGTH=10000 # Maximum source lines scanned for useful bibliographic evidence
+: "${LLM_HEAD_LINES:=220}"       # Beginning-of-document lines included in the evidence packet
+: "${LLM_TAIL_LINES:=80}"        # End-of-sample lines included in the evidence packet
+: "${LLM_METADATA_LINES:=120}"   # Metadata-like lines included in the evidence packet
+: "${LLM_CONTEXT_CHARS:=16000}"  # Maximum characters sent as document evidence
 
 # Capture current date-time as YYYYMMDDHHMMSS.
 CURRENT_TIME=$(date +"%Y%m%d%H%M%S")
@@ -94,11 +98,6 @@ time_start() {
 # 4. Converts the total elapsed time into minutes and seconds format.
 # 5. Logs the elapsed time for the current operation and the cumulative total time
 #    in MM:SS format to both the console and a log file (LOG_FILE).
-#
-# Variables:
-# - TIME_START: The start time of the operation (should be set before calling this function).
-# - TIME_TOTAL: The cumulative total elapsed time (should be initialized before calling this function).
-# - LOG_FILE: The file where the timing information will be appended.
 ###############
 
 time_stop() {
@@ -177,6 +176,56 @@ clean_file_name() {
     printf '%s\n' "$tmp"
 }
 
+###############
+# Build a compact, structured evidence packet for a small language model.
+#
+# Preserve useful line structure and punctuation instead of flattening the
+# entire extraction into one long string. Include the beginning of the book,
+# bibliographic-looking lines from the wider sample, and a short tail section.
+###############
+
+prepare_llm_text() {
+    local input_file="$1"
+    local normalized_file
+    local metadata_file
+    normalized_file=$(mktemp)
+    metadata_file=$(mktemp)
+
+    # Normalize quotes and whitespace while retaining line boundaries that help
+    # the model distinguish title pages, copyright blocks, headings, and body text.
+    head -n "$EXTRACT_SENT_TO_LLM_LENGTH" "$input_file" |
+        python3 "$SCRIPT_DIR/scripts/clean_quotes.py" |
+        tr '\r\t' '  ' |
+        LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' |
+        sed -E \
+            -e 's/[[:space:]]+/ /g' \
+            -e 's/^ +//; s/ +$//' \
+            -e '/^[0-9]{1,3}$/d' \
+            -e '/^[ivxlcdmIVXLCDM]{1,8}$/d' |
+        awk 'NF { print; blank=0; next } !blank { print ""; blank=1 }' > "$normalized_file"
+
+    # Pull high-value bibliographic clues from beyond the first few pages.
+    grep -Eai '(^|[^[:alpha:]])(isbn|issn|doi|copyright|publisher|published|publication|edition|volume|vol[.]?|author|written by|edited by|translated by|library of congress|cataloging|imprint)([^[:alpha:]]|$)|©' "$normalized_file" |
+        head -n "$LLM_METADATA_LINES" > "$metadata_file" || true
+
+    {
+        printf '%s\n' '=== BEGINNING OF DOCUMENT ==='
+        head -n "$LLM_HEAD_LINES" "$normalized_file"
+
+        if [ -s "$metadata_file" ]; then
+            printf '\n%s\n' '=== BIBLIOGRAPHIC CLUES FOUND ELSEWHERE ==='
+            cat "$metadata_file"
+        fi
+
+        printf '\n%s\n' '=== END OF SAMPLED DOCUMENT TEXT ==='
+        tail -n "$LLM_TAIL_LINES" "$normalized_file"
+    } |
+        awk 'prev != $0 { print } { prev=$0 }' |
+        python3 -c 'import sys; limit=int(sys.argv[1]); sys.stdout.write(sys.stdin.read()[:limit])' "$LLM_CONTEXT_CHARS"
+
+    rm -f "$normalized_file" "$metadata_file"
+}
+
 fix_legacy_possessive_filename() {
     # Convert legacy "word s word" patterns into possessive form.
     local stem="$1"
@@ -188,13 +237,6 @@ fix_legacy_possessive_filename() {
 # (passed as an argument) is valid. The function evaluates the input string
 # and returns a success status (0) if the string is non-empty, not "null",
 # and not "NA". Otherwise, it returns a failure status (1).
-#
-# Parameters:
-#   $1 - The response string to validate.
-#
-# Returns:
-#   0 - If the response is valid.
-#   1 - If the response is invalid.
 ###############
 
 good_response() {
@@ -210,24 +252,6 @@ good_response() {
 ###############
 # This function, `append_index_if_duplicate`, ensures that a file path is unique by appending
 # an incremental index to the file name if a file with the same name already exists.
-#
-# Parameters:
-#   $1 - The full path of the file to check for duplicates.
-#
-# Behavior:
-#   - Extracts the directory, file name, and extension from the input path.
-#   - Strips any existing numeric suffix (e.g., "_1", "_2") from the file name.
-#   - Constructs a new file path by appending an incremental numeric suffix (e.g., "_1", "_2")
-#     if a file with the same name already exists in the directory.
-#   - Returns the unique file path.
-#
-# Output:
-#   - Prints the unique file path to stdout.
-#
-# Example:
-#   Input: /path/to/file.txt
-#   If /path/to/file.txt exists, the function will return /path/to/file_1.txt.
-#   If /path/to/file_1.txt also exists, it will return /path/to/file_2.txt, and so on.
 ###############
 
 append_index_if_duplicate() {
@@ -296,31 +320,10 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
     if [[ "/$rel_path" != *"/$ORIGINALS_SUBDIR/"* ]] && [[ "/$rel_path" != *"/$FAILED_SUBDIR/"* ]]; then
 
         ###############
-        # The following processes a list of files and attempts to extract text from them for renaming purposes.
-        # It supports PDF, EPUB, and CHM file formats. Unsupported file types are skipped.
-        #
-        # Steps:
-        # 1. Logs the start of processing for each file.
-        # 2. Extracts the filename and its extension.
-        # 3. Converts the file to plain text:
-        #    - For PDFs, uses `pdftotext`.
-        #    - For EPUB and CHM files, uses `ebook-convert`.
-        #    - Skips unsupported file types with a log message.
-        # 4. Checks if the text extraction was successful:
-        #    - Skips the file if the resulting text file is empty.
-        # 5. Processes the extracted text:
-        #    - Reads the first n lines of the text.
-        #    - Cleans the text by removing special characters, non-printable characters, and redundant spaces.
-        #    - Limits the processed text to 26,000 characters.
-        # 6. Prepares the extracted text for further processing (e.g., renaming).
-        #
-        # Variables:
-        # - `file`: The current file being processed.
-        # - `LOG_FILE`: The log file where processing details are recorded.
-        # - `temp_file`: Temporary file used to store extracted text.
-        # - `extracted_text`: The cleaned and processed text extracted from the file.
-        # - `new_name`: Placeholder for the new name of the file (to be implemented).
-        # - `to_skip`: Flag indicating whether the file should be skipped.
+        # Extract text, clean it, and present a compact evidence packet to the LLM.
+        # The packet preserves useful document structure and emphasizes likely
+        # bibliographic clues so smaller models do not have to search a long,
+        # flattened body-text string.
         ###############
 
         echo "-----------------------------------------------------------------------------------------------------------------------------------------------------------" | tee -a "$LOG_FILE"
@@ -346,7 +349,6 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
 
         extension="${filename##*.}"
         extension="${extension,,}"
-        # filename_noext="${filename%.*}"
 
         # Convert file to plain text
         temp_file=$(mktemp)
@@ -370,18 +372,11 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
             continue
         fi
 
-    proc_txt=$(mktemp)
-    head -n $EXTRACT_SENT_TO_LLM_LENGTH "$temp_file" | python3 "$SCRIPT_DIR/scripts/clean_quotes.py" > "$proc_txt"
-
-    extracted_text=$(cat "$proc_txt" | tr '\n' ' ' | tr '\r' ' ' | tr '\t' ' ' | tr '\\' ' ' | tr '/' ' ' | tr '$' ' ' | tr '^' ' ')
-    rm -f "$proc_txt"
-        extracted_text=$(echo "$extracted_text" | sed -e 's/[^[:print:]]//g' -e 's/- -/ /g' -e 's/\. \. \./ /g' -e 's/\.\.\.\./ /g')
-        extracted_text=$(echo "$extracted_text" | sed -e 's/  */ /g' -e 's/ \.\.\. /./g' -e 's/: )/ /g' -e 's/) :/ /g' -e 's/,,/ /g' -e 's/, \. ,/ /g' -e 's/, ,/ /g' -e 's/\. \./ /g' -e 's/  */ /g')
-        extracted_text="${extracted_text:0:26000}"
-        # echo "Extracted text: $extracted_text"
+        extracted_text=$(prepare_llm_text "$temp_file")
         new_name=""
         to_skip=true
-        check_blank=$(echo "$extracted_text" | tr -d ' ')
+        check_blank=$(printf '%s' "$extracted_text" | tr -d '[:space:]')
+
         if [ -n "$check_blank" ]; then
 
             retry=1
@@ -389,49 +384,44 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
             while true; do
 
                 ###############
-                # The following interacts with an API (OpenAI API based model) to extract and format metadata
-                # for eBooks based on provided text. The script performs the following steps:
-                #
-                # 1. Constructs a cURL command to send a POST request to the API endpoint.
-                #    - The system instructions define the role of the model as a metadata extractor.
-                #    - The user prompt provides the text to analyze and specifies the desired output format.
-                #
-                # 2. Logs the constructed command to a log file for debugging purposes.
-                #
-                # 3. Executes the API request and captures the response in a temporary file.
-                #    - Measures the time taken for the API call using `time_start` and `time_stop` functions.
-                #
-                # 4. Processes the API response:
-                #    - Reads the response from the temporary file and removes non-printable characters.
-                #    - Logs the raw API response for debugging.
-                #    - Checks if the response contains an error message.
-                #      - If an error is detected, logs the error and skips further processing.
-                #
-                # 5. Parses the API response to extract the formatted metadata:
-                #    - Attempts to extract the metadata using `jq` to parse the JSON response.
-                #    - Cleans the extracted metadata using the `clean_file_name` function.
-                #    - Validates the parsed metadata using the `good_response` function.
-                #    - If the initial parsing fails, attempts to extract the metadata using `sed` as a fallback.
-                #
-                # 6. Logs the parsed metadata and determines whether to proceed or retry based on validation.
-                #
-                # 7. Cleans up temporary files and handles retries or skips as necessary.
-                #
-                # Notes:
-                # - The script enforces strict formatting for the metadata output.
-                # - It includes error handling for API errors and invalid responses.
-                # - The script supports retries but currently has the retry delay commented out.
-                # - The API response is expected to be in JSON format, and the metadata is extracted from the "content" field.
+                # Ask the model for one bibliographic filename. Instructions are
+                # deliberately short, explicit, evidence-ranked, and repetitive
+                # about the one-line output contract for better small-model behavior.
                 ###############
 
-                # Build payload with jq instead of shell-escaped eval to avoid quoting errors.
-                user_prompt="Extract the book title, volume(s), author(s), publication year, and ISBN (if available) from the following text.  Convert accented characters to their closest ASCII equivalents:\n\n${extracted_text}\n\nIf you cannot find any of these explicitly, examine the content to see if you can identify the publication by some other means. Return ONLY in this format: \"Title - Author(s) (Year) [ISBN]\". Only return ONE match, the most likely. Do NOT return more than one. If you are unsure then return NA. If you do not obtain an ISBN by inspecting this text extract, please perform a web lookup to try to determine it indirectly from other sources. If the information is not in English, French or Spanish, please perform a translation into English. Pay special attention to volume numbers (if any), being sure to include the specific volume number of a series in the title. Do not return all volume names, just the one you have identified. If the book has more than three authors, only return the first three followed by et al. Please ensure that you return only characters that are legal in a Linux filename."
+                system_prompt="You are a precise bibliographic metadata extractor for noisy OCR text. Use only the supplied evidence. Never invent missing facts, never claim an external lookup, and never explain your reasoning. Return exactly one filename line in the requested format or exactly NA."
+
+                printf -v user_prompt '%s\n' \
+                    'TASK' \
+                    'Identify the single book or publication represented by the evidence below.' \
+                    '' \
+                    'OUTPUT - EXACTLY ONE LINE' \
+                    'Title - Author(s) (Year) [ISBN]' \
+                    'If the publication cannot be identified confidently, output exactly: NA' \
+                    '' \
+                    'RULES' \
+                    '1. Output one line only. No quotes, labels, markdown, commentary, XML, or <think> text.' \
+                    '2. Use only the supplied evidence. Do not browse, guess, or invent missing metadata.' \
+                    '3. Evidence priority: title/copyright pages and explicit ISBN/publisher lines > table of contents/headings > body references.' \
+                    '4. Title: use the publication title. Include a clearly identified subtitle and the specific volume number when applicable.' \
+                    '5. Authors: use credited publication authors, not people merely mentioned. Use at most three names; if more, append et al.' \
+                    '6. Year: use a four-digit publication year supported by title/copyright/publication evidence. Ignore years from citations or examples.' \
+                    '7. ISBN: prefer ISBN-13, otherwise ISBN-10. Remove spaces and hyphens. If no ISBN is present, use NA inside the brackets.' \
+                    '8. Transliterate accented Latin characters to plain ASCII when practical. Translate the title to English only when the source language is not English, French, or Spanish.' \
+                    '9. Do not surround the answer with quotation marks. Do not include slash characters in the filename.' \
+                    '' \
+                    'SOURCE FILENAME - WEAK HINT ONLY; DOCUMENT EVIDENCE WINS' \
+                    "$filename" \
+                    '' \
+                    'DOCUMENT EVIDENCE' \
+                    "$extracted_text" \
+                    'END DOCUMENT EVIDENCE'
 
                 payload_file=$(mktemp)
                 jq -n --arg model "$MODEL" \
-                    --arg system "You are a metadata extractor. Return ONLY the formatted book details." \
+                    --arg system "$system_prompt" \
                     --arg user "$user_prompt" \
-                    '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], temperature:0.3, max_tokens:90000}' > "$payload_file"
+                    '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], temperature:0.1, max_tokens:256}' > "$payload_file"
 
                 echo "Executing curl with payload in $payload_file" >>"$LOG_FILE"
 
@@ -520,20 +510,6 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
         else
             ###############
             # The following processes and renames files, with special handling for `.chm` files.
-            # It performs the following steps:
-            # 1. Cleans the new file name using the `clean_file_name` function.
-            # 2. Extracts the old file's name and path for reference.
-            # 3. Checks the file extension:
-            #    - If the file is a `.chm` file:
-            #      - Converts it to a `.pdf` file using `ebook-convert`.
-            #      - Deletes the original `.chm` file after conversion.
-            #    - For other file types:
-            #      - Renames the file to the cleaned name with its original extension.
-            # 4. Handles file name collisions by appending an index to the new name if necessary,
-            #    using the `append_index_if_duplicate` function.
-            # 5. Logs all operations to a log file (`$LOG_FILE`) and provides user feedback:
-            #    - Indicates when a file is renamed or converted.
-            #    - Notes when no renaming is required or when an index is added to avoid collisions.
             ###############
 
             new_name=$(clean_file_name "$new_name")
