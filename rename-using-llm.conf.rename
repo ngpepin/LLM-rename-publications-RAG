@@ -1,7 +1,7 @@
 PROJ_DIR="/.../rename-ebooks"                  # Replace with the actual path to your project directory
 API_ENDPOINT="https://.../v1/chat/completions" # Replace with your actual API endpoint
-MODEL="gpt-4.1"                                # Replace with your desired model
-API_KEY=""                                     # Replace when your endpoint requires authentication
+MODEL="..."                                    # Replace with your desired model
+API_KEY="..."                                  # Replace when your endpoint requires authentication
 
 # LLM extraction features
 ENABLE_CRITIC=true

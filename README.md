@@ -1,104 +1,278 @@
 # LLM-Augmented Renaming of Publications
 
-## Overview
+A Bash-first toolkit for extracting bibliographic metadata from ebooks/publications, renaming files into a stable canonical format, archiving originals, and converting common ebook formats to PDF for downstream indexing or RAG workflows.
 
-This repository helps normalize, rename, and prepare ebook and publication files for downstream indexing or RAG ingestion.
+## What This Repository Does
 
-It supports two main rename flows:
+The project provides two rename paths:
 
-1. `rename-using-llm.sh`
-   Renames files from their content using an LLM API.
-2. `rename-using-ebooks-tools.sh`
-   Uses `ebook-tools` and related scripts for metadata-based renaming.
+1. **LLM-based renaming** — `rename-using-llm.sh`
+   - extracts text and optional page images from the publication
+   - sends bounded evidence to an OpenAI-compatible chat-completions endpoint
+   - validates and repairs the model response
+   - preserves source volume/edition information
+   - archives the original and renames the working file in place
 
-The preferred end-to-end entry point is:
+2. **ebook-tools metadata renaming** — `rename-using-ebooks-tools.sh`
+   - runs the repository's ebook-tools workflow in Docker
+   - fixes/stages the resulting metadata-based names
+   - returns renamed files to the input directory and archives originals
+
+For normal use, start with the repository launcher:
 
 ```bash
-./rename.sh /path/to/books
+./rename-ebooks.sh /path/to/books
 ```
 
-That wrapper:
+`rename-ebooks.sh` is a symlink-safe root launcher for `rename.sh`.
 
-1. runs `rename-using-llm.sh`
-2. then converts any remaining non-PDF files to PDF using the conversion scripts in this repo
+## Canonical Filename Format
 
-Supported source formats in the main LLM flow: `pdf`, `epub`, `mobi`, `chm`
+The LLM workflow targets:
 
-## Current File Behavior
+```text
+Title - Author(s) (YYYY|NA) [ISBN|NA].ext
+```
 
-The repo no longer writes renamed files into a `Renamed/` subdirectory.
+Examples:
 
-Current behavior for the LLM-based flow:
+```text
+Mastering Linux Security and Hardening - Donald A. Tevault (2023) [9781837630516].pdf
+Prometheus: Up & Running, Second Edition - Julien Pivotto and Brian Brazil (2023) [9781098131142].pdf
+```
 
-- renamed files stay in the same directory as the original file
-- the pre-rename source file is copied into a sibling `Originals/` directory
-- files that cannot be processed are moved into `Failed/`
-- `mobi` and `chm` files are converted to PDF as part of the rename step
+### Author separator rules
 
-Current behavior for the conversion scripts:
+The canonical author separator is ` - `.
 
-- converted PDFs are written into the same directory as the source file
-- the source non-PDF file is moved into a `Converted/` subdirectory after successful conversion
+Do **not** use cover-style `by Author` syntax for the author field. For example:
 
-Current behavior for `rename-using-ebooks-tools.sh`:
+```text
+A Great Book by Jane Smith (2024) [9781234567890]
+```
 
-- Docker output is staged temporarily
-- final renamed files are moved back into the input directory
-- original top-level input files are copied into `Originals/`
+normalizes to:
+
+```text
+A Great Book - Jane Smith (2024) [9781234567890]
+```
+
+The normalization is context-sensitive rather than global. Legitimate title text containing the word `by` is preserved:
+
+```text
+Learn by Doing - Jane Smith (2024) [9781234567890]
+```
+
+A title may also contain earlier ` - ` separators. The workflow treats the **final** bibliographic ` - ` as the title/author boundary.
+
+### Volume and edition preservation
+
+The LLM flow preserves explicit bibliographic details rather than trusting a model rewrite blindly:
+
+- numbered source volumes are retained when omitted by the model
+- edition evidence is retained and normalized
+- stronger source/front-matter evidence takes precedence over weaker model output
+- an edition already present in the title is not duplicated
+
+For example, this cover-style output:
+
+```text
+Skills for AI Agents, Volume 1 - First Edition (Building Context with Dynamic Skills for Agentic Systems) by Lucas B. Nicolosi Soares (2027) [9798341673991]
+```
+
+is normalized to:
+
+```text
+Skills for AI Agents, Volume 1 - First Edition (Building Context with Dynamic Skills for Agentic Systems) - Lucas B. Nicolosi Soares (2027) [9798341673991]
+```
+
+without creating an extra `First Edition` marker.
+
+## Current File and Directory Behavior
+
+The active Bash workflow does **not** use a `Renamed/` output directory.
+
+### LLM rename flow
+
+- renamed files remain in their working directory
+- the pre-rename source is archived in a sibling `Originals/` directory
+- unrecoverable files are moved to `Failed/`
+- recursive scanning skips `Originals/` and `Failed/`
+- CHM and MOBI inputs may be converted to PDF as part of the rename step
+- unchanged canonical filenames are not given a pointless `_1` suffix
+- `_1`, `_2`, and later suffixes are used only for genuine destination collisions
+- the archived original has its own independent collision-safe naming
+
+### Standalone conversion helpers
+
+After a successful conversion:
+
+- the generated PDF stays in the source directory
+- the non-PDF source moves into a `Converted/` subdirectory
+
+### ebook-tools flow
+
+The ebook-tools path uses Docker for metadata processing and temporary staging. Final renamed files are moved back into the input directory, while original top-level files are archived under `Originals/`.
+
+## Supported Formats
+
+### `rename-using-llm.sh`
+
+- PDF
+- EPUB
+- MOBI
+- CHM
+
+### Post-rename conversion pass in `rename.sh`
+
+- EPUB → PDF
+- MOBI → PDF
+- CHM → PDF
+- AZW3 → PDF
+
+The conversion pass recursively visits directories under the target while pruning `Originals/`, `Failed/`, and `Converted/`.
 
 ## Repository Layout
 
-- `rename.sh`
-  Preferred wrapper for LLM rename plus post-rename PDF conversion.
-- `rename-using-llm.sh`
-  Content-based rename flow using an LLM endpoint.
-- `rename-using-ebooks-tools.sh`
-  Metadata-based rename flow using `ebook-tools`.
-- `prefix-by-year.sh`
-  Utility that prefixes files with `YYYY - ` when a year is found, or `____ - ` when no year is found.
-- `fix-matches.sh`
-  Repairs the directory structure produced by `ebook-tools`.
-- `convert-epub-to-pdf.sh`
-- `convert-mobi-to-pdf.sh`
-- `convert-chm-to-pdf.sh`
-- `convert-azw3-to-pdf.sh`
-  One-format conversion helpers.
+- `rename-ebooks.sh` — repository-root launcher; forwards to `rename.sh`
+- `rename.sh` — preferred end-to-end rename + conversion wrapper
+- `rename-using-llm.sh` — primary LLM-based rename implementation
+- `rename-using-ebooks-tools.sh` — alternate Docker/ebook-tools metadata flow
+- `rename-using-llm.conf` — LLM endpoint/model/features configuration
+- `rename-using-ebooks-tools.conf` — ebook-tools wrapper configuration
+- `config.json` — ebook-tools JSON configuration
+- `install-update.sh` — host dependency checker/installer
+- `scripts/clean_quotes.py` — quote cleanup helper used by the LLM renamer
+- `fix-matches.sh` — repairs/stages ebook-tools matches
+- `prefix-by-year.sh` — prefixes files with a publication year marker
+- `convert-epub-to-pdf.sh` — EPUB converter
+- `convert-mobi-to-pdf.sh` — MOBI converter
+- `convert-chm-to-pdf.sh` — CHM converter
+- `convert-azw3-to-pdf.sh` — AZW3 converter
+- `logs/` — processing logs
+
+`README-LANGCHAIN.md` documents the older Python/LangChain implementation separately; the Bash workflow described here is the current primary path.
 
 ## Installation
 
-Clone the repository:
+### 1. Clone the repository
 
 ```bash
-git clone https://github.com/ngpepin/LLM-rename-publications-RAG.git
+git clone https://github.com/ngpepin/LLM-rename-publications-RAG.git rename-ebooks
 cd rename-ebooks
 ```
 
-Install the main dependencies:
+### 2. Check host dependencies
+
+Use the repository's host dependency entry point:
+
+```bash
+./install-update.sh --check
+```
+
+The primary LLM flow requires these commands:
 
 - `jq`
-- `docker`
-- `unzip`
+- `pdftotext`
+- `pdftoppm` when multimodal extraction is enabled
+- `ebook-convert`
+- `python3`
+- `curl`
+- `bc`
+
+On Debian/Ubuntu, these correspond mainly to:
+
+- `jq`
 - `poppler-utils`
 - `calibre`
+- `python3`
+- `curl`
+- `bc`
 
-Depending on which scripts you use, you may also need:
+To preview what the installer would do:
 
-- `mobi_unpack`
-- `file`
+```bash
+./install-update.sh --dry-run
+```
+
+To let it offer installation of missing Debian/Ubuntu packages interactively:
+
+```bash
+./install-update.sh
+```
+
+It does not install packages without confirmation.
+
+### 3. ebook-tools dependencies
+
+The alternate metadata flow additionally requires:
+
+- Docker
+- the repository's ebook-tools support files/configuration
 
 ## Configuration
 
-The main configuration files are:
+The primary configuration file is:
 
-- `rename-using-llm.conf`
-- `rename-using-ebooks-tools.conf`
-- `config.json`
+```text
+rename-using-llm.conf
+```
 
-`rename-using-llm.sh` expects a working API endpoint and model configuration in `rename-using-llm.conf`.
+Important values include:
+
+```bash
+PROJ_DIR="/path/to/rename-ebooks"
+API_ENDPOINT="http://localhost:PORT/v1/chat/completions"
+MODEL="your-model"
+API_KEY=""
+```
+
+The endpoint must be compatible with the OpenAI chat-completions request/response shape expected by `rename-using-llm.sh`.
+
+### LLM extraction and validation features
+
+Current feature switches include:
+
+```bash
+ENABLE_CRITIC=true
+ENABLE_MULTIMODAL=true
+MULTIMODAL_MAX_IMAGES=3
+MULTIMODAL_SCAN_PAGES=8
+MULTIMODAL_IMAGE_DPI=110
+MULTIMODAL_NONWHITE_FRACTION=0.001
+```
+
+When multimodal mode is enabled, `pdftoppm` is required. The script scans a bounded set of pages and includes only selected page images as supporting evidence.
+
+### Retry/timeout tuning
+
+```bash
+API_TIMEOUT_SECONDS=120
+API_RETRY_DELAY_SECONDS=2
+MAX_INVALID_RESPONSE_RETRIES=3
+```
+
+The script tests API connectivity before processing the input set and writes failures to the processing log.
 
 ## Usage
 
-### Preferred Wrapper
+### Preferred launcher
+
+```bash
+./rename-ebooks.sh /path/to/books
+./rename-ebooks.sh --llm /path/to/books
+./rename-ebooks.sh --ebook-tools /path/to/books
+```
+
+Help can be shown without launching the workflow:
+
+```bash
+./rename-ebooks.sh --help
+```
+
+### End-to-end wrapper
+
+You can also call `rename.sh` directly:
 
 ```bash
 ./rename.sh /path/to/books
@@ -106,38 +280,41 @@ The main configuration files are:
 ./rename.sh --ebook-tools /path/to/books
 ```
 
-Use this when you want:
+Options:
 
-- LLM-based semantic renaming first by default
-- then conversion of renamed `epub`, `mobi`, `chm`, and `azw3` files to PDF
+```text
+-l, --llm          use the LLM rename flow (default)
+-e, --ebook-tools  use the ebook-tools metadata flow
+-h, --help         show usage
+```
 
-Use `--ebook-tools` if you want the metadata-based rename flow before the same conversion pass.
+After the rename step, `rename.sh` converts remaining EPUB, MOBI, CHM, and AZW3 files to PDF where the corresponding helper applies.
 
-The wrapper skips `Originals/`, `Failed/`, and `Converted/` directories during its conversion pass.
-
-### LLM-Based Renaming Only
+### LLM renaming only
 
 ```bash
 ./rename-using-llm.sh /path/to/books
 ```
 
-Use this when you want semantic renaming without the extra conversion pass performed by `rename.sh`.
+Use this when you want the semantic rename/archive behavior without the wrapper's later conversion pass.
 
-### Metadata-Based Renaming
+### ebook-tools metadata path
+
+Single-directory shorthand:
+
+```bash
+./rename-using-ebooks-tools.sh /path/to/books
+```
+
+Or explicit input/output options:
 
 ```bash
 ./rename-using-ebooks-tools.sh -i /path/to/input -o /path/to/output
 ```
 
-Or, with a single directory argument:
+See the script's `--help` output for its additional config, fresh-image, and debug switches.
 
-```bash
-./rename-using-ebooks-tools.sh /path/to/input
-```
-
-In the current implementation, final renamed files are placed back into the input directory and originals are archived into `Originals/`.
-
-### Individual Conversion Scripts
+### Individual conversion helpers
 
 ```bash
 ./convert-epub-to-pdf.sh /path/to/books
@@ -146,38 +323,114 @@ In the current implementation, final renamed files are placed back into the inpu
 ./convert-azw3-to-pdf.sh /path/to/books
 ```
 
-These scripts operate on files in the specified directory only (`maxdepth 1`).
+These helpers process files in the directory given to them; successful conversions archive the original source in `Converted/`.
 
-### Prefix Existing Files By Year
+### Prefix existing files by year
 
 ```bash
 ./prefix-by-year.sh /path/to/books
 ./prefix-by-year.sh --dry-run /path/to/books
 ```
 
-Behavior:
+The utility:
 
-- skips files already prefixed as `YYYY - ` or `____ - `
-- prefixes with `YYYY - ` when a valid year in the configured range is found
-- prefixes with `____ - ` when no year is found
-- avoids filename-length failures by truncating safely when needed
+- skips names already prefixed with `YYYY - ` or `____ - `
+- uses `YYYY - ` when a valid year is found
+- uses `____ - ` when no year is found
+- truncates safely when needed to avoid filename-length failures
 
-## RAG-Oriented Workflow
+## How the LLM Rename Flow Works
 
-Typical usage looks like this:
+At a high level, `rename-using-llm.sh` does the following for each supported file:
 
-1. Normalize and rename source documents.
-   ```bash
-   ./rename.sh /data/publications
-   ```
-2. Feed the resulting PDFs and archived originals into your chunking, embedding, and indexing pipeline.
+1. identifies the current filename and extension
+2. repairs a legacy possessive-name artifact when present
+3. extracts text from the publication
+4. builds a bounded evidence packet from likely bibliographic portions of the document
+5. optionally extracts page images for multimodal evidence
+6. asks the configured model for a canonical filename stem
+7. optionally asks a critic pass to repair a weak first result
+8. performs deterministic cleanup
+9. enforces the required `Title - Author (Year) [ISBN]` structure
+10. preserves explicit source volume/edition information
+11. normalizes terminal `by Author` credits to the canonical ` - Author` form
+12. archives the original in `Originals/`
+13. renames the working file in place, adding a numeric suffix only for a real collision
 
-## Notes
+This layered approach is intentional: the final filename is not accepted solely because the model returned something plausible.
 
-- Re-running the LLM flow is intended to be safe because processed originals are archived and collisions are handled.
-- Conversion scripts create `Converted/` directories only when they successfully move source files out of the working directory.
-- Logs are written under `logs/`.
-- Canonical script entrypoints are the `.sh` files; extensionless symlink aliases are local convenience only.
+## Logging and Troubleshooting
+
+Logs are written under:
+
+```text
+logs/
+```
+
+Typical filename shape:
+
+```text
+rename_books_<PID>_<TIMESTAMP>.log
+```
+
+### API connection failures
+
+Check:
+
+- the configured `API_ENDPOINT`
+- that the server is running
+- the configured `MODEL`
+- the API key, if the endpoint requires one
+
+### Text extraction failures
+
+Check the relevant commands:
+
+```bash
+command -v pdftotext
+command -v pdftoppm
+command -v ebook-convert
+```
+
+or run:
+
+```bash
+./install-update.sh --check
+```
+
+### Unexpected `_1` suffixes
+
+A numeric suffix is expected only when another file already occupies the desired destination path. Reprocessing a file whose generated canonical name is already exactly its current filename should not create `_1` just because the source itself exists.
+
+### Author shown as `by ...`
+
+The current canonical format does not use `by` as the author separator. A terminal cover-style `by Author (Year) [ISBN]` credit is normalized to ` - Author (Year) [ISBN]`; title text that legitimately contains `by` is preserved.
+
+## Typical RAG Preparation Workflow
+
+```bash
+./rename-ebooks.sh /data/publications
+```
+
+Afterward, feed the normalized PDFs (and any source artifacts you intentionally retain) into your chunking, embedding, and indexing pipeline.
+
+## Development and Validation
+
+For shell changes, at minimum run:
+
+```bash
+bash -n path/to/changed-script.sh
+git diff --check
+```
+
+Filename-normalization changes should also exercise focused edge cases such as:
+
+- `by Author` normalization
+- legitimate `by` inside a title
+- titles containing multiple ` - ` separators
+- edition and volume preservation
+- duplicate-edition prevention
+- unchanged filenames not receiving `_1`
 
 ## License
 

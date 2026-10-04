@@ -208,8 +208,9 @@ report_api_failure() {
 # 1. Remove leading "Title -" wrappers.
 # 2. Normalize whitespace.
 # 3. Repair legacy "word s word" possessive artifacts.
-# 4. Convert straight quotes/apostrophes via scripts/clean_quotes.py.
-# 5. Collapse repeated asterisks/spaces, remove surrounding quotes, and strip invalid filename bytes.
+# 4. Normalize a terminal "by Author" credit to the required " - Author" separator.
+# 5. Convert straight quotes/apostrophes via scripts/clean_quotes.py.
+# 6. Collapse repeated asterisks/spaces, remove surrounding quotes, and strip invalid filename bytes.
 ###############
 
 clean_file_name() {
@@ -230,6 +231,31 @@ clean_file_name() {
 
     # Legacy fix: convert "word s word" to "word's word" (artifact from old rename logic).
     new_name=$(printf '%s' "$new_name" | sed -E "s/([[:alpha:]][[:alpha:]]+) s ([[:alpha:]])/\\1's \\2/g")
+
+    # Normalize cover-style author credits such as "... by Jane Smith (2024) [ISBN]"
+    # to the canonical bibliographic separator. Restrict this to the terminal
+    # author/year/ISBN shape so ordinary uses of "by" inside a title are preserved.
+    new_name=$(python3 - "$new_name" <<'PY'
+import re
+import sys
+
+value = sys.argv[1]
+match = re.search(
+    r"(?i)\s+by\s+(.+?)\s+\((\d{4}|NA)\)\s+\[([^\[\]]+)\]\s*$",
+    value,
+)
+# Treat terminal "by Author" as an author credit only when it occurs after the
+# last existing " - " separator. This preserves legitimate title text such as
+# "Learn by Doing - Jane Smith ..." while fixing cover-style author credits.
+if match and match.start() > value.rfind(" - "):
+    prefix = value[:match.start()].rstrip()
+    author = match.group(1).strip()
+    year = match.group(2)
+    isbn = match.group(3).strip()
+    value = f"{prefix} - {author} ({year}) [{isbn}]"
+print(value)
+PY
+)
 
     # Use helper script for quote normalization.
     local after_py
@@ -289,11 +315,108 @@ volume = source_match.group(1).upper() if re.fullmatch(r"(?i)[IVXLCDM]+", source
 marker = f"Volume {volume}"
 
 if " - " in candidate:
-    title, rest = candidate.split(" - ", 1)
+    # Use the final bibliographic separator; an earlier separator may be part of
+    # the title/subtitle rather than the author boundary.
+    title, rest = candidate.rsplit(" - ", 1)
     title = title.rstrip(" ,;:-")
     print(f"{title}, {marker} - {rest}")
 else:
     print(candidate)
+PY
+}
+
+ensure_edition() {
+    # Edition is identity-bearing metadata just like volume. Reconcile edition
+    # conflicts deterministically instead of silently trusting the model:
+    # standalone front-matter evidence > explicit source filename > model output.
+    local candidate="$1"
+    local source_name="$2"
+    local evidence="$3"
+
+    python3 - "$candidate" "$source_name" "$evidence" <<'PY'
+import re
+import sys
+
+candidate = sys.argv[1].strip()
+source_name = sys.argv[2].strip()
+evidence = sys.argv[3]
+
+words = {
+    "first": "First", "second": "Second", "third": "Third", "fourth": "Fourth",
+    "fifth": "Fifth", "sixth": "Sixth", "seventh": "Seventh", "eighth": "Eighth",
+    "ninth": "Ninth", "tenth": "Tenth", "eleventh": "Eleventh", "twelfth": "Twelfth",
+    "thirteenth": "Thirteenth", "fourteenth": "Fourteenth", "fifteenth": "Fifteenth",
+    "sixteenth": "Sixteenth", "seventeenth": "Seventeenth", "eighteenth": "Eighteenth",
+    "nineteenth": "Nineteenth", "twentieth": "Twentieth",
+}
+num_words = {
+    1: "First", 2: "Second", 3: "Third", 4: "Fourth", 5: "Fifth", 6: "Sixth",
+    7: "Seventh", 8: "Eighth", 9: "Ninth", 10: "Tenth", 11: "Eleventh", 12: "Twelfth",
+    13: "Thirteenth", 14: "Fourteenth", 15: "Fifteenth", 16: "Sixteenth",
+    17: "Seventeenth", 18: "Eighteenth", 19: "Nineteenth", 20: "Twentieth",
+}
+
+ordinal = (
+    r"(?:\d{1,2}(?:st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|"
+    r"eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|"
+    r"sixteenth|seventeenth|eighteenth|nineteenth|twentieth)"
+)
+edition_re = re.compile(
+    rf"(?i)\b({ordinal})\s+(?:edition\b|ed\.?(?=$|[\s,;:)\].-]))"
+)
+standalone_re = re.compile(
+    rf"(?im)^\s*({ordinal})\s+(?:edition\b|ed\.?)\s*$"
+)
+
+def canonical_token(token):
+    token = token.lower()
+    if token in words:
+        return f"{words[token]} Edition"
+    number_match = re.match(r"\d+", token)
+    if not number_match:
+        return ""
+    number = int(number_match.group(0))
+    return f"{num_words[number]} Edition" if number in num_words else f"{token} Edition"
+
+def canonical_match(match):
+    return canonical_token(match.group(1)) if match else ""
+
+# Strongest evidence: an edition stated on its own front-matter line. Restricting
+# this to standalone lines avoids incidental prose such as "changes from the
+# second edition to the third edition".
+front_match = standalone_re.search(evidence)
+front_marker = canonical_match(front_match)
+
+# Next strongest: an explicit edition in the source filename.
+source_match = edition_re.search(source_name)
+source_marker = canonical_match(source_match)
+
+if " - " not in candidate:
+    print(candidate)
+    raise SystemExit(0)
+
+# Use the final bibliographic separator. Titles/subtitles may legitimately contain
+# an earlier " - ", so splitting at the first one can misclassify title text as authors.
+title, rest = candidate.rsplit(" - ", 1)
+title = title.rstrip(" ,;:-")
+candidate_match = edition_re.search(title)
+candidate_marker = canonical_match(candidate_match)
+
+# Evidence precedence is explicit and deterministic. Strong evidence may correct
+# a conflicting model edition; the model is used only when no stronger edition
+# evidence exists.
+marker = front_marker or source_marker or candidate_marker
+if not marker:
+    print(candidate)
+    raise SystemExit(0)
+
+if candidate_match:
+    title = title[:candidate_match.start()] + marker + title[candidate_match.end():]
+    title = re.sub(r"\s{2,}", " ", title).strip().rstrip(" ,;:-")
+else:
+    title = f"{title}, {marker}"
+
+print(f"{title} - {rest}")
 PY
 }
 
@@ -553,10 +676,12 @@ good_response() {
 strict_response_format() {
     # Final acceptance check after the critic/fallback pass.
     local new_name="$1"
+    local author_tail="${new_name##* - }"
 
     [[ -n "$new_name" ]] || return 1
     [[ "$new_name" != *$'\n'* && "$new_name" != *$'\r'* ]] || return 1
     [[ "$new_name" != */* ]] || return 1
+    [[ ! "$author_tail" =~ [[:space:]][Bb][Yy][[:space:]] ]] || return 1
 
     [[ "$new_name" =~ ^.+[[:space:]]-[[:space:]].+[[:space:]]\(([0-9]{4}|NA)\)[[:space:]]\[([0-9]{13}|[0-9]{9}[0-9Xx]|NA)\]$ ]]
 }
@@ -564,6 +689,7 @@ strict_response_format() {
 response_format_issue() {
     # Explain the most useful reason a model candidate failed validation.
     local new_name="$1"
+    local author_tail="${new_name##* - }"
 
     if [[ -z "$new_name" || "$new_name" == "null" || "$new_name" == "NA" ]]; then
         printf '%s' "model returned no usable bibliographic candidate"
@@ -571,6 +697,8 @@ response_format_issue() {
         printf '%s' "model returned multiple lines"
     elif [[ "$new_name" == */* ]]; then
         printf '%s' "model used a slash instead of the required ' - ' title/author separator"
+    elif [[ "$author_tail" =~ [[:space:]][Bb][Yy][[:space:]] ]]; then
+        printf '%s' "author credit uses 'by' instead of the required ' - ' separator"
     elif [[ "$new_name" != *" - "* ]]; then
         printf '%s' "missing the required ' - ' separator between title and authors"
     elif [[ ! "$new_name" =~ \(([0-9]{4}|NA)\) ]]; then
@@ -650,7 +778,7 @@ if not isbn:
     isbn = "NA"
 
 # Avoid manufacturing a repair unless the candidate still has a usable title/author split.
-title, authors = candidate.split(" - ", 1)
+title, authors = candidate.rsplit(" - ", 1)
 title = title.strip()
 authors = authors.strip()
 if not title or not authors:
@@ -672,7 +800,7 @@ candidate = sys.argv[1].strip()
 # Tolerate common near-miss formatting from small/local models.
 candidate = re.sub(r"\s+/\s+", " - ", candidate)
 candidate = re.sub(r"\((\d{4}|NA)\)\s*[.,;:]\s*(?=\[)", r"(\1) ", candidate, flags=re.IGNORECASE)
-match = re.fullmatch(r"(.+?)\s+-\s+(.+?)\s+\(([^()]*)\)\s+\[([^\[\]]*)\]", candidate)
+match = re.fullmatch(r"(.+)\s+-\s+(.+?)\s+\(([^()]*)\)\s+\[([^\[\]]*)\]", candidate)
 if not match:
     raise SystemExit(1)
 title, authors, year, isbn = (part.strip() for part in match.groups())
@@ -753,8 +881,8 @@ critic_review_candidate() {
         '' \
         'REQUIREMENTS' \
         '1. Return exactly one line and nothing else.' \
-        '2. Preserve all bibliographic facts already present; correct formatting only. Never remove a volume designation such as Volume 1, Volume 2, Vol. 3, or a Roman-numeral volume.' \
-        '3. Treat an explicit volume designation as part of the title so separately stored volumes remain distinguishable. Title and author fields must be non-empty. The separator between them MUST be exactly space-hyphen-space: " - ". Replace a slash separator with " - ".' \
+        '2. Preserve all bibliographic facts already present; correct formatting only. Never remove an edition designation (First Edition, 2nd Edition, Third Edition, etc.) or a volume designation such as Volume 1, Volume 2, Vol. 3, or a Roman-numeral volume.' \
+        '3. Treat explicit edition and volume designations as part of the title so different editions/volumes remain distinguishable. Title and author fields must be non-empty. The separator between them MUST be exactly space-hyphen-space: " - ". Replace a slash separator or a cover-style "by Author" credit with " - Author"; never use "by" to denote the author.' \
         '4. Year must be exactly four digits or NA.' \
         '5. ISBN must be ISBN-13 (13 digits), ISBN-10 (10 characters, final X allowed), or NA. Remove ISBN spaces and hyphens.' \
         '6. Do not surround the answer with quotation marks. Do not include slash characters.' \
@@ -1037,13 +1165,13 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                     'RULES' \
                     '1. Output one line only. No quotes, labels, markdown, commentary, JSON, XML, reasoning, or <think> text.' \
                     '2. Use only the supplied evidence. Do not browse, guess, or invent missing metadata.' \
-                    '3. Evidence priority: title/copyright pages and explicit ISBN/publisher/volume lines > table of contents/headings > body references. The source filename may be used as supporting evidence for an explicit volume number when document evidence does not contradict it.' \
-                    '4. Title: use the publication title. ALWAYS include a clearly identified volume designation for an individual volume (for example Volume 1, Volume 2, Vol. 3, or Volume IV), normalizing it to "Volume N" when practical. Treat the volume designation as part of the title. Do not drop it even when all volumes otherwise share the same title, authors, year, or ISBN.' \
-                    '5. Before answering, explicitly check the title page, cover, copyright information, headers, and source filename for volume information. If an individual volume number is supported, the output filename must contain it so multi-volume works cannot collide. Authors: use credited publication authors, not people merely mentioned. Use at most three names; if more, append et al.' \
+                    '3. Evidence priority: title/copyright pages and explicit ISBN/publisher/edition/volume lines > source filename edition/volume hints > table of contents/headings > body references. If edition sources conflict, an explicit standalone front-matter edition line wins over the source filename, and both win over an unsupported model guess.' \
+                    '4. Title: use the publication title. ALWAYS include a clearly identified EDITION for a specific edition (for example First Edition, 2nd Edition, Third Edition, 4th Ed.) and a clearly identified volume designation for an individual volume. Normalize edition wording to "First Edition", "Second Edition", "Third Edition", etc. when practical, and volume wording to "Volume N" when practical. Treat both edition and volume as part of the title. Never drop them when supported by the evidence.' \
+                    '5. Before answering, explicitly check the title page, cover, copyright information, revision-history/front-matter lines, headers, and source filename for EDITION and volume information. If a specific edition or individual volume is supported, the output filename MUST contain it so different editions or volumes cannot collide. Authors: use credited publication authors, not people merely mentioned. Use at most three names; if more, append et al.' \
                     '6. Year: use a four-digit publication year supported by title/copyright/publication evidence. A copyright line for the identified edition is strong evidence. Ignore years from citations, examples, historical discussion, or references. If unavailable, use NA. The year MUST appear in its own parentheses immediately before the ISBN.' \
                     '7. ISBN: prefer ISBN-13, otherwise ISBN-10. Remove spaces and hyphens. Put the ISBN ONLY inside square brackets at the end; never put ISBN in parentheses where the year belongs. If no ISBN is present, use NA inside the brackets.' \
                     '8. Transliterate accented Latin characters to plain ASCII when practical. Translate the title to English only when the source language is not English, French, or Spanish.' \
-                    '9. Between title and authors, use exactly space-hyphen-space: " - ". Never use a slash as that separator. Do not surround the answer with quotation marks or include slash characters.' \
+                    '9. Between title and authors, use exactly space-hyphen-space: " - ". Never use "by" to denote the author and never use a slash as that separator. For example, output "Book Title - Jane Smith (2024) [ISBN]", not "Book Title by Jane Smith (2024) [ISBN]". Do not surround the answer with quotation marks or include slash characters.' \
                     '10. If page images are attached, inspect them as high-priority visual evidence, especially title, copyright, publisher, author, volume, and ISBN details.' \
                     '' \
                     'SOURCE FILENAME - WEAK HINT ONLY; DOCUMENT EVIDENCE WINS' \
@@ -1118,12 +1246,14 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 rm -f "$temp_response_file" >/dev/null 2>&1
                 new_name=$(clean_file_name "$new_name")
                 new_name=$(ensure_source_volume "$new_name" "$filename")
+                new_name=$(ensure_edition "$new_name" "$filename" "$extracted_text")
                 new_name=$(repair_candidate_from_evidence "$new_name" "$extracted_text")
                 primary_candidate="$new_name"
                 echo "Parsed name: $new_name" >>"$LOG_FILE"
                 accepted_name=""
                 if accepted_name=$(accept_first_pass_candidate "$new_name"); then
                     new_name=$(ensure_source_volume "$accepted_name" "$filename")
+                    new_name=$(ensure_edition "$new_name" "$filename" "$extracted_text")
                     to_skip=false
                     break
                 fi
@@ -1132,11 +1262,13 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 new_name=$(echo "$LLM_RESPONSE" | sed -n 's/.*"content":"\\"\(.*\)\\"".*/\1/p')
                 new_name=$(clean_file_name "$new_name")
                 new_name=$(ensure_source_volume "$new_name" "$filename")
+                new_name=$(ensure_edition "$new_name" "$filename" "$extracted_text")
                 new_name=$(repair_candidate_from_evidence "$new_name" "$extracted_text")
                 echo "Sed output: $new_name" >>"$LOG_FILE"
                 accepted_name=""
                 if accepted_name=$(accept_first_pass_candidate "$new_name"); then
                     new_name=$(ensure_source_volume "$accepted_name" "$filename")
+                    new_name=$(ensure_edition "$new_name" "$filename" "$extracted_text")
                     to_skip=false
                     break
                 fi
@@ -1225,7 +1357,16 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
             else
                 new_filename="${new_name}.${extension}"
                 new_path="$old_filepath/$new_filename"
-                final_path=$(append_index_if_duplicate "$new_path")
+
+                # When the generated name is unchanged, the apparent collision is
+                # the source file itself. It is archived to Originals below, so no
+                # index is needed in the working directory. Only probe for a real
+                # collision when the destination differs from the current path.
+                if [[ "$new_path" == "$old_file" ]]; then
+                    final_path="$new_path"
+                else
+                    final_path=$(append_index_if_duplicate "$new_path")
+                fi
                 final_name=$(basename -- "$final_path")
 
                 if [[ "$new_filename" != "$old_filename" ]]; then
