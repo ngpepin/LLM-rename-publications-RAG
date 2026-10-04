@@ -262,26 +262,46 @@ PY
     new_name=$(printf '%s' "$new_name" | sed -E "s/([[:alpha:]][[:alpha:]]+) s ([[:alpha:]])/\\1's \\2/g")
 
     # Normalize cover-style author credits such as "... by Jane Smith (2024) [ISBN]"
-    # to the canonical bibliographic separator. Restrict this to the terminal
-    # author/year/ISBN shape so ordinary uses of "by" inside a title are preserved.
+    # to the canonical bibliographic separator. Also collapse explicit contributor
+    # role lists to the primary editor when the model/source emits strings such as
+    # "EDITED BY Mark A.; FOREWORD BY ...; INTRODUCTION BY ...". Secondary foreword
+    # and introduction contributors are not publication authors and should not make
+    # an otherwise valid bibliographic filename fail the strict "by" check.
     new_name=$(python3 - "$new_name" <<'PY'
 import re
 import sys
 
 value = sys.argv[1]
+
+# First normalize a structured contributor tail. Match against the whole value
+# rather than splitting on the final separator because a small model may corrupt
+# "EDITED BY Name" into "EDITED - Name", introducing an extra " - ".
+m = re.fullmatch(
+    r"(?is)(.+?)\s+-\s+EDITED\s+(?:BY\s+|-\s*)(.+?)(?:\s*;\s*(?:FOREWORD|INTRODUCTION|PREFACE)\s+BY\s+.+?)*\s+\((\d{4}|NA)\)\s+\[([^\[\]]+)\]\s*",
+    value,
+)
+if m:
+    title = m.group(1).strip()
+    editor = m.group(2).strip().rstrip(" ;,")
+    year = m.group(3)
+    isbn = m.group(4).strip()
+    value = f"{title} - {editor} (Editor) ({year}) [{isbn}]"
+
+# Then handle a plain terminal "by Author" author credit. Restrict this to the
+# terminal author/year/ISBN shape so ordinary uses of "by" inside a title survive.
+# Do not reinterpret a secondary contributor role such as "Foreword by ..." as
+# the book's author if a structured role list escaped the normalization above.
 match = re.search(
     r"(?i)\s+by\s+(.+?)\s+\((\d{4}|NA)\)\s+\[([^\[\]]+)\]\s*$",
     value,
 )
-# Treat terminal "by Author" as an author credit only when it occurs after the
-# last existing " - " separator. This preserves legitimate title text such as
-# "Learn by Doing - Jane Smith ..." while fixing cover-style author credits.
 if match and match.start() > value.rfind(" - "):
     prefix = value[:match.start()].rstrip()
-    author = match.group(1).strip()
-    year = match.group(2)
-    isbn = match.group(3).strip()
-    value = f"{prefix} - {author} ({year}) [{isbn}]"
+    if not re.search(r"(?i)(?:^|[;,:—–-])\s*(?:FOREWORD|INTRODUCTION|PREFACE)\s*$", prefix):
+        author = match.group(1).strip()
+        year = match.group(2)
+        isbn = match.group(3).strip()
+        value = f"{prefix} - {author} ({year}) [{isbn}]"
 print(value)
 PY
 )
@@ -1050,7 +1070,7 @@ critic_review_candidate() {
         'REQUIREMENTS' \
         '1. Return exactly one line and nothing else.' \
         '2. Preserve all bibliographic facts already present; correct formatting only. Put the title itself in conventional English Title Case. Never remove an edition designation (First Edition, 2nd Edition, Third Edition, etc.) or a volume designation such as Volume 1, Volume 2, Vol. 3, or a Roman-numeral volume.' \
-        '3. Treat explicit edition and volume designations as part of the title so different editions/volumes remain distinguishable. Title and author fields must be non-empty. The separator between them MUST be exactly space-hyphen-space: " - ". Replace a slash separator or a cover-style "by Author" credit with " - Author"; never use "by" to denote the author.' \
+        '3. Treat explicit edition and volume designations as part of the title so different editions/volumes remain distinguishable. Title and author fields must be non-empty. The separator between them MUST be exactly space-hyphen-space: " - ". Replace a slash separator or a cover-style "by Author" credit with " - Author"; never use "by" to denote the author. If the candidate contains role credits such as "Edited by X; Foreword by Y; Introduction by Z", keep the primary editor X as the bibliographic contributor (for example "X (Editor)") and do not treat foreword/introduction contributors as authors.' \
         '4. Year must be exactly four digits or NA.' \
         '5. ISBN must be ISBN-13 (13 digits), ISBN-10 (10 characters, final X allowed), or NA. Remove ISBN spaces and hyphens.' \
         '6. Do not surround the answer with quotation marks. Do not include slash characters.' \
@@ -1112,6 +1132,7 @@ critic_review_candidate() {
     fi
 
     reviewed_name=$(clean_file_name "$reviewed_name")
+    reviewed_name=$(enforce_title_case_candidate "$reviewed_name")
     echo "Critic reviewed name: $reviewed_name" >>"$LOG_FILE"
 
     if strict_response_format "$reviewed_name"; then
