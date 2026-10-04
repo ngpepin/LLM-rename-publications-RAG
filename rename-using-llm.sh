@@ -564,11 +564,109 @@ cleanup_multimodal_images() {
     MULTIMODAL_IMAGE_FILES=()
 }
 
+prepare_epub_embedded_images() {
+    local source_file="$1"
+    local output_dir="$2"
+
+    python3 - "$source_file" "$output_dir" "$MULTIMODAL_MAX_IMAGES" <<'PY'
+import posixpath
+import sys
+import zipfile
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+source = Path(sys.argv[1])
+output_dir = Path(sys.argv[2])
+limit = int(sys.argv[3])
+
+mime_ext = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+try:
+    archive = zipfile.ZipFile(source)
+except Exception:
+    raise SystemExit(0)
+
+with archive:
+    names = set(archive.namelist())
+    ordered = []
+
+    try:
+        container = ET.fromstring(archive.read("META-INF/container.xml"))
+        rootfile = next(
+            elem.attrib.get("full-path")
+            for elem in container.iter()
+            if elem.tag.endswith("rootfile") and elem.attrib.get("full-path")
+        )
+        package = ET.fromstring(archive.read(rootfile))
+        base = posixpath.dirname(rootfile)
+        manifest = []
+        cover_id = None
+
+        for elem in package.iter():
+            if elem.tag.endswith("meta") and elem.attrib.get("name", "").lower() == "cover":
+                cover_id = elem.attrib.get("content")
+            elif elem.tag.endswith("item"):
+                item_id = elem.attrib.get("id", "")
+                href = elem.attrib.get("href", "")
+                media_type = elem.attrib.get("media-type", "")
+                properties = elem.attrib.get("properties", "")
+                if href and media_type in mime_ext:
+                    path = posixpath.normpath(posixpath.join(base, href))
+                    manifest.append((item_id, path, media_type, properties))
+
+        for item_id, path, media_type, properties in manifest:
+            if "cover-image" in properties.split() or (cover_id and item_id == cover_id):
+                ordered.append((path, media_type))
+        for item_id, path, media_type, properties in manifest:
+            candidate = (path, media_type)
+            if candidate not in ordered:
+                ordered.append(candidate)
+    except Exception:
+        pass
+
+    if not ordered:
+        for name in sorted(names):
+            lowered = name.lower()
+            if lowered.endswith((".jpg", ".jpeg")):
+                ordered.append((name, "image/jpeg"))
+            elif lowered.endswith(".png"):
+                ordered.append((name, "image/png"))
+            elif lowered.endswith(".webp"):
+                ordered.append((name, "image/webp"))
+            elif lowered.endswith(".gif"):
+                ordered.append((name, "image/gif"))
+
+    emitted = 0
+    seen = set()
+    for archive_path, media_type in ordered:
+        if emitted >= limit or archive_path in seen or archive_path not in names:
+            continue
+        seen.add(archive_path)
+        try:
+            data = archive.read(archive_path)
+        except Exception:
+            continue
+        # Skip tiny decorative assets/icons; retain likely cover/page artwork.
+        if len(data) < 8192:
+            continue
+        suffix = mime_ext.get(media_type, Path(archive_path).suffix.lower() or ".img")
+        destination = output_dir / f"epub-image-{emitted + 1}{suffix}"
+        destination.write_bytes(data)
+        print(destination)
+        emitted += 1
+PY
+}
+
 prepare_multimodal_images() {
     local source_file="$1"
     local extension="$2"
     local pdf_source="$source_file"
-    local scan_prefix pgm page_token page_number jpeg_root jpeg_file
+    local scan_prefix pgm page_token page_number jpeg_root jpeg_file embedded_image
 
     cleanup_multimodal_images
     feature_enabled "$ENABLE_MULTIMODAL" || return 0
@@ -577,6 +675,15 @@ prepare_multimodal_images() {
     if [[ "$extension" != "pdf" ]]; then
         pdf_source="$MULTIMODAL_WORK_DIR/source.pdf"
         if ! ebook-convert "$source_file" "$pdf_source" >/dev/null 2>>"$LOG_FILE"; then
+            if [[ "$extension" == "epub" ]]; then
+                while IFS= read -r embedded_image; do
+                    [[ -s "$embedded_image" ]] && MULTIMODAL_IMAGE_FILES+=("$embedded_image")
+                done < <(prepare_epub_embedded_images "$source_file" "$MULTIMODAL_WORK_DIR")
+                if ((${#MULTIMODAL_IMAGE_FILES[@]} > 0)); then
+                    echo "Multimodal evidence: using ${#MULTIMODAL_IMAGE_FILES[@]} embedded EPUB image(s) after PDF conversion failed." >>"$LOG_FILE"
+                    return 0
+                fi
+            fi
             echo "Multimodal extraction unavailable: conversion to PDF failed." >>"$LOG_FILE"
             return 0
         fi
@@ -666,7 +773,15 @@ if images:
     content = [{"type": "text", "text": user_prompt}]
     for image in images:
         data = base64.b64encode(image.read_bytes()).decode("ascii")
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}})
+        suffix = image.suffix.lower()
+        mime = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+        }.get(suffix, "image/jpeg")
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}})
 else:
     content = user_prompt
 payload = {

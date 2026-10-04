@@ -56,7 +56,7 @@ The script:
 
 1. extracts text (`pdftotext` for PDF, `ebook-convert` for other supported formats)
 2. builds a bounded evidence packet from the document
-3. optionally extracts page images for multimodal evidence
+3. optionally extracts page images for multimodal evidence; EPUB inputs use temporary-PDF rendering when possible and fall back to embedded EPUB images if that conversion fails
 4. calls the configured OpenAI-compatible chat-completions API
 5. optionally runs a critic pass
 6. performs deterministic cleanup and strict filename validation

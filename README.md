@@ -242,7 +242,7 @@ MULTIMODAL_IMAGE_DPI=110
 MULTIMODAL_NONWHITE_FRACTION=0.001
 ```
 
-When multimodal mode is enabled, `pdftoppm` is required. The script scans a bounded set of pages and includes only selected page images as supporting evidence.
+When multimodal mode is enabled, `pdftoppm` is required. PDF inputs are scanned directly. EPUB, MOBI, and CHM inputs are first converted to a temporary PDF for page-image extraction; for EPUB specifically, if that temporary PDF conversion fails, the script falls back to selected embedded EPUB images (prioritizing declared cover artwork) so multimodal evidence can still be supplied.
 
 ### Retry/timeout tuning
 
