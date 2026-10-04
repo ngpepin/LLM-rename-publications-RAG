@@ -224,10 +224,39 @@ clean_file_name() {
     new_name=$(printf '%s' "$new_name" | tr '\n\r\t' '   ')
     new_name=$(printf '%s' "$new_name" | sed 's/^ *//; s/ *$//')
 
-    # Small/local models commonly use a spaced slash as the bibliographic
-    # separator even when asked for " - ". Normalize that harmless variant
-    # before removing slash characters that are invalid in Linux filenames.
-    new_name=$(printf '%s' "$new_name" | sed -E 's/[[:space:]]+\/[[:space:]]+/ - /g')
+    # Small/local models commonly use a spaced slash or Unicode dash as the
+    # bibliographic separator even when asked for " - ". Normalize those
+    # harmless variants before strict validation and filename sanitization.
+    new_name=$(python3 - "$new_name" <<'PY'
+import re
+import sys
+
+value = sys.argv[1]
+# Treat literal field labels as missing metadata rather than retrying the model.
+# These are placeholders, not bibliographic facts, so converting them to NA is
+# deterministic and does not invent a year or ISBN.
+value = re.sub(r"(?i)\(\s*year\s*\)", "(NA)", value)
+value = re.sub(r"(?i)\[\s*isbn\s*\]", "[NA]", value)
+
+# Normalize only the final spaced slash/Unicode-dash separator when everything
+# after it has the expected author + year + ISBN shape. Earlier dashes may be
+# legitimate title punctuation and must remain untouched.
+separators = list(re.finditer(r"\s+(?:/|[—–])\s+", value))
+if separators:
+    sep = separators[-1]
+    suffix = value[sep.end():]
+    # Do not rewrite title punctuation when a later canonical separator already
+    # provides the author boundary. If the Unicode/slash separator occurs after
+    # every canonical separator, however, it is the likely author boundary.
+    if sep.start() > value.rfind(" - ") and re.fullmatch(
+        r".+?\s+\((?:\d{4}|NA)\)\s+\[(?:\d{13}|\d{9}[\dXx]|NA)\]\s*",
+        suffix,
+        flags=re.IGNORECASE,
+    ):
+        value = value[:sep.start()] + " - " + suffix
+print(value)
+PY
+)
 
     # Legacy fix: convert "word s word" to "word's word" (artifact from old rename logic).
     new_name=$(printf '%s' "$new_name" | sed -E "s/([[:alpha:]][[:alpha:]]+) s ([[:alpha:]])/\\1's \\2/g")
