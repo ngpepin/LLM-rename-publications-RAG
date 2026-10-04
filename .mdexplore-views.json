@@ -1,0 +1,50 @@
+{
+  "files": {
+    "README-LANGCHAIN.md": {
+      "active_view_id": 1,
+      "next_tab_color_index": 1,
+      "next_view_id": 2,
+      "next_view_sequence": 2,
+      "preview": {
+        "layout": 0,
+        "zoom_factor": 1.0
+      },
+      "tabs": [
+        {
+          "color_slot": 0,
+          "sequence": 1,
+          "view_id": 1
+        }
+      ],
+      "view_states": {
+        "1": {
+          "scroll_y": 360.0,
+          "top_line": 11
+        }
+      }
+    },
+    "README.md": {
+      "active_view_id": 1,
+      "next_tab_color_index": 1,
+      "next_view_id": 2,
+      "next_view_sequence": 2,
+      "preview": {
+        "layout": 0,
+        "zoom_factor": 1.0
+      },
+      "tabs": [
+        {
+          "color_slot": 0,
+          "sequence": 1,
+          "view_id": 1
+        }
+      ],
+      "view_states": {
+        "1": {
+          "scroll_y": 7680.0,
+          "top_line": 344
+        }
+      }
+    }
+  }
+}

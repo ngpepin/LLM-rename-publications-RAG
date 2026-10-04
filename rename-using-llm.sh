@@ -970,24 +970,104 @@ if not match:
 
 title, authors, year, isbn = (part.strip() for part in match.groups())
 small = {"a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into", "nor", "of", "on", "onto", "or", "per", "the", "to", "via", "vs", "with"}
+
+# Canonical spellings for acronyms, initialisms, standards, product names, and
+# casing-sensitive technical terms. Match case-insensitively because small/local
+# models often emit "Apis", "Iot", "Llms", "Mlops", etc. before this final
+# deterministic title normalization pass.
+canonical_terms = {
+    term.lower(): term
+    for term in """
+AI AGI ANI ASI ML DL NLP NLU NLG LLM RAG RL RLHF DPO PPO SFT LoRA QLoRA GAN CNN RNN LSTM GRU VAE OCR ASR TTS
+API SDK CLI GUI IDE REPL ABI FFI RPC REST RESTful gRPC GraphQL JSON JSONL XML YAML TOML CSV TSV HTML XHTML CSS DOM HTTP HTTPS URL URI URN UUID GUID MIME JWT OAuth OIDC SAML LDAP CORS CSRF XSS SSRF SQL NoSQL ACID CRUD ORM JDBC ODBC DBMS RDBMS ETL ELT OLTP OLAP BI BSON Protobuf Avro Parquet ORC
+OpenAPI OpenAI ChatGPT GPT Anthropic Claude Gemini Copilot
+AWS GCP SaaS PaaS IaaS FaaS IAM VPC VPN CDN DNS DNSSEC DHCP TCP UDP IP TLS SSL SSH SFTP FTP FTPS SMTP IMAP POP3 SNMP NTP ICMP BGP OSPF NAT CIDR VLAN WLAN LAN WAN SDN NFV QoS MQTT AMQP QUIC WebSocket WebRTC WebDAV SIP RTP RTSP SMB CIFS NFS iSCSI
+SIEM SOAR SOC MFA SSO RBAC ABAC ACL PKI AES DES RSA ECC ECDSA SHA HMAC KMS TPM HSM CVE CVSS CWE CTF OWASP MITRE YARA IOC DLP EDR XDR MDR IDS IPS WAF CASB CSPM CNAPP SAST DAST IAST SBOM SCA PAM UEBA NDR UTM IOC TTP ATT&CK STIX TAXII
+IoT IIoT MLOps AIOps DevOps DevSecOps FinOps GitOps DataOps SecOps NoOps
+CPU GPU TPU NPU RAM ROM SSD HDD NVMe PCIe USB HDMI FPGA ASIC SoC SIMD MIMD NUMA BIOS UEFI ACPI SATA CUDA ROCm ARM ARM64 AMD64 RISC RISC-V POSIX GNU BSD WSL RHEL RPM DEB APT PCI ISA DMA IOMMU MMU ECC DIMM SRAM DRAM VRAM
+macOS iOS iPadOS watchOS tvOS visionOS JavaScript TypeScript PowerShell WebAssembly OpenSSL OpenSSH OpenGL OpenCL OpenCV eBPF iPhone iPad eBook ePub LaTeX BibTeX TeX
+Git GitHub GitLab Bitbucket CI CD JVM JDK JRE WASM PHP VBA JSX TSX npm Yarn pnpm Maven Gradle NuGet pip Conda
+MySQL PostgreSQL SQLite MongoDB MariaDB CouchDB DynamoDB HBase NiFi Redis Cassandra Neo4j InfluxDB Elasticsearch OpenSearch ClickHouse Snowflake BigQuery Redshift
+Docker Kubernetes OpenShift Terraform Ansible Helm Jenkins ArgoCD Podman containerd BuildKit Dockerfile Compose Istio Envoy Prometheus Grafana
+PyPI PyTorch TensorFlow Keras JAX CUDA NumPy SciPy pandas Matplotlib scikit-learn XGBoost LightGBM HuggingFace ONNX MLflow
+SRE SLA SLO SLI APM OpenTelemetry OTLP Jaeger Zipkin RUM RTO RPO MTTR MTBF
+ISO IEC IEEE ANSI RFC W3C ECMA ASCII UTF Unicode POSIX IETF WHATWG WCAG
+PDF EPUB MOBI AZW AZW3 JPEG JPG PNG GIF SVG TIFF WebP AVIF HEIF HEIC MP3 MP4 AAC FLAC WAV OGG MKV MOV AVI MPEG HLS DASH
+AR VR XR GIS GPS GNSS RFID NFC QR CAD CAM CAE CNC PLC SCADA HVAC BIM LiDAR RADAR HMI DCS RTU OPC UA
+DNA RNA mRNA tRNA rRNA PCR qPCR RT-PCR CRISPR MRI fMRI EEG ECG EKG EMG STEM CT PET SNP SNPs NGS FASTA FASTQ BAM SAM VCF
+CEO CFO CTO CIO CISO COO CDO CPO CSO KPI OKR ROI ROAS CRM ERP SCM HCM B2B B2C D2C SMB SME TAM SAM SOM ARR MRR CAGR EBITDA
+GDPR HIPAA PCI DSS NIST SOX FERPA CCPA CPRA FIPS FedRAMP SOC 2 ISO 27001
+""".split()
+}
+
 word_re = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
 words = list(word_re.finditer(title))
 first = words[0].start() if words else -1
 last = words[-1].start() if words else -1
 
+def canonical_term(word):
+    # Preserve a possessive suffix while canonicalizing the technical term.
+    possessive = ""
+    base = word
+    possessive_match = re.fullmatch(r"(.+?)(['’]s)", word, flags=re.IGNORECASE)
+    if possessive_match:
+        base, possessive = possessive_match.groups()
+
+    low = base.lower()
+    if low in canonical_terms:
+        return canonical_terms[low] + possessive
+
+    # Pluralize an all-uppercase canonical initialism predictably: APIs, SDKs,
+    # LLMs, GPUs, CVEs, etc., even when the model returned Apis/Sdks/Llms/Gpus.
+    if low.endswith("s") and low[:-1] in canonical_terms:
+        canonical = canonical_terms[low[:-1]]
+        if canonical.isupper() and len(canonical) >= 2:
+            return canonical + "s" + possessive
+
+    return None
+
 def title_word(match):
     word = match.group(0)
     low = word.lower()
+    canonical = canonical_term(word)
+    if canonical is not None:
+        return canonical
     if match.start() not in {first, last} and low in small:
         return low
     if re.fullmatch(r"[ivxlcdm]+", low):
         return low.upper()
-    # Preserve short all-caps initialisms/acronyms such as AI, RAG, SQL, API.
+    # Preserve unknown short all-caps initialisms/acronyms as a fallback.
     if word.isupper() and 2 <= len(word) <= 5 and low not in small:
         return word
     return low[:1].upper() + low[1:]
 
 title = word_re.sub(title_word, title)
+
+# A few stylized terms contain punctuation/digits that the word tokenizer treats
+# as separate tokens. Normalize those after the main pass.
+post_canonical = (
+    (r"(?i)\bNode\.Js\b", "Node.js"),
+    (r"(?i)\bNext\.Js\b", "Next.js"),
+    (r"(?i)\bVue\.Js\b", "Vue.js"),
+    (r"(?i)\bASP\.Net\b", "ASP.NET"),
+    (r"(?i)(?<![A-Za-z0-9_])\.Net\b", ".NET"),
+    (r"(?i)\bK8S\b", "K8s"),
+    (r"(?i)\bIPV4\b", "IPv4"),
+    (r"(?i)\bIPV6\b", "IPv6"),
+    (r"(?i)\bHTTP/2\b", "HTTP/2"),
+    (r"(?i)\bHTTP/3\b", "HTTP/3"),
+    (r"(?i)\bCI/CD\b", "CI/CD"),
+    (r"(?i)\bTCP/IP\b", "TCP/IP"),
+    (r"(?i)\bWI-FI\b", "Wi-Fi"),
+    (r"(?i)\bX86_64\b", "x86_64"),
+    (r"(?i)\bX86\b", "x86"),
+    (r"(?i)\bX64\b", "x64"),
+    (r"(?i)\bNeo4J\b", "Neo4j"),
+    (r"(?i)\bSCIKIT-LEARN\b", "scikit-learn"),
+    (r"(?i)\bHUGGINGFACE\b", "HuggingFace"),
+)
+for pattern, replacement in post_canonical:
+    title = re.sub(pattern, replacement, title)
 print(f"{title} - {authors} ({year.upper()}) [{isbn}]")
 PY
 }
