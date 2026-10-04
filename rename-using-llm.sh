@@ -223,6 +223,11 @@ clean_file_name() {
     new_name=$(printf '%s' "$new_name" | tr '\n\r\t' '   ')
     new_name=$(printf '%s' "$new_name" | sed 's/^ *//; s/ *$//')
 
+    # Small/local models commonly use a spaced slash as the bibliographic
+    # separator even when asked for " - ". Normalize that harmless variant
+    # before removing slash characters that are invalid in Linux filenames.
+    new_name=$(printf '%s' "$new_name" | sed -E 's/[[:space:]]+\/[[:space:]]+/ - /g')
+
     # Legacy fix: convert "word s word" to "word's word" (artifact from old rename logic).
     new_name=$(printf '%s' "$new_name" | sed -E "s/([[:alpha:]][[:alpha:]]+) s ([[:alpha:]])/\\1's \\2/g")
 
@@ -258,6 +263,38 @@ clean_file_name() {
     fi
 
     printf '%s\n' "$tmp"
+}
+
+ensure_source_volume() {
+    # Preserve an explicitly numbered volume from the source filename when the
+    # model otherwise returns a valid-looking bibliographic candidate without it.
+    # This avoids collisions between separately stored volumes of the same work.
+    local candidate="$1"
+    local source_name="$2"
+
+    python3 - "$candidate" "$source_name" <<'PY'
+import re
+import sys
+
+candidate = sys.argv[1].strip()
+source_name = sys.argv[2].strip()
+
+volume_re = re.compile(r"(?i)\b(?:volume|vol\.?)\s*([0-9]+|[IVXLCDM]+)\b")
+source_match = volume_re.search(source_name)
+if not source_match or volume_re.search(candidate):
+    print(candidate)
+    raise SystemExit(0)
+
+volume = source_match.group(1).upper() if re.fullmatch(r"(?i)[IVXLCDM]+", source_match.group(1)) else source_match.group(1)
+marker = f"Volume {volume}"
+
+if " - " in candidate:
+    title, rest = candidate.split(" - ", 1)
+    title = title.rstrip(" ,;:-")
+    print(f"{title}, {marker} - {rest}")
+else:
+    print(candidate)
+PY
 }
 
 ###############
@@ -524,6 +561,27 @@ strict_response_format() {
     [[ "$new_name" =~ ^.+[[:space:]]-[[:space:]].+[[:space:]]\(([0-9]{4}|NA)\)[[:space:]]\[([0-9]{13}|[0-9]{9}[0-9Xx]|NA)\]$ ]]
 }
 
+response_format_issue() {
+    # Explain the most useful reason a model candidate failed validation.
+    local new_name="$1"
+
+    if [[ -z "$new_name" || "$new_name" == "null" || "$new_name" == "NA" ]]; then
+        printf '%s' "model returned no usable bibliographic candidate"
+    elif [[ "$new_name" == *$'\n'* || "$new_name" == *$'\r'* ]]; then
+        printf '%s' "model returned multiple lines"
+    elif [[ "$new_name" == */* ]]; then
+        printf '%s' "model used a slash instead of the required ' - ' title/author separator"
+    elif [[ "$new_name" != *" - "* ]]; then
+        printf '%s' "missing the required ' - ' separator between title and authors"
+    elif [[ ! "$new_name" =~ \(([0-9]{4}|NA)\) ]]; then
+        printf '%s' "missing or invalid four-digit publication year"
+    elif [[ ! "$new_name" =~ \[([0-9]{13}|[0-9]{9}[0-9Xx]|NA)\]$ ]]; then
+        printf '%s' "missing or invalid ISBN/NA field at the end"
+    else
+        printf '%s' "candidate does not match the required filename structure"
+    fi
+}
+
 deterministic_candidate_cleanup() {
     local candidate
     candidate=$(clean_file_name "$1")
@@ -533,6 +591,9 @@ import re
 import sys
 
 candidate = sys.argv[1].strip()
+# Tolerate common near-miss formatting from small/local models.
+candidate = re.sub(r"\s+/\s+", " - ", candidate)
+candidate = re.sub(r"\((\d{4}|NA)\)\s*[.,;:]\s*(?=\[)", r"(\1) ", candidate, flags=re.IGNORECASE)
 match = re.fullmatch(r"(.+?)\s+-\s+(.+?)\s+\(([^()]*)\)\s+\[([^\[\]]*)\]", candidate)
 if not match:
     raise SystemExit(1)
@@ -614,8 +675,8 @@ critic_review_candidate() {
         '' \
         'REQUIREMENTS' \
         '1. Return exactly one line and nothing else.' \
-        '2. Preserve all bibliographic facts already present; correct formatting only.' \
-        '3. Title and author fields must be non-empty.' \
+        '2. Preserve all bibliographic facts already present; correct formatting only. Never remove a volume designation such as Volume 1, Volume 2, Vol. 3, or a Roman-numeral volume.' \
+        '3. Treat an explicit volume designation as part of the title so separately stored volumes remain distinguishable. Title and author fields must be non-empty. The separator between them MUST be exactly space-hyphen-space: " - ". Replace a slash separator with " - ".' \
         '4. Year must be exactly four digits or NA.' \
         '5. ISBN must be ISBN-13 (13 digits), ISBN-10 (10 characters, final X allowed), or NA. Remove ISBN spaces and hyphens.' \
         '6. Do not surround the answer with quotation marks. Do not include slash characters.' \
@@ -898,13 +959,13 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                     'RULES' \
                     '1. Output one line only. No quotes, labels, markdown, commentary, JSON, XML, reasoning, or <think> text.' \
                     '2. Use only the supplied evidence. Do not browse, guess, or invent missing metadata.' \
-                    '3. Evidence priority: title/copyright pages and explicit ISBN/publisher lines > table of contents/headings > body references.' \
-                    '4. Title: use the publication title. Include a clearly identified subtitle and the specific volume number when applicable.' \
-                    '5. Authors: use credited publication authors, not people merely mentioned. Use at most three names; if more, append et al.' \
+                    '3. Evidence priority: title/copyright pages and explicit ISBN/publisher/volume lines > table of contents/headings > body references. The source filename may be used as supporting evidence for an explicit volume number when document evidence does not contradict it.' \
+                    '4. Title: use the publication title. ALWAYS include a clearly identified volume designation for an individual volume (for example Volume 1, Volume 2, Vol. 3, or Volume IV), normalizing it to "Volume N" when practical. Treat the volume designation as part of the title. Do not drop it even when all volumes otherwise share the same title, authors, year, or ISBN.' \
+                    '5. Before answering, explicitly check the title page, cover, copyright information, headers, and source filename for volume information. If an individual volume number is supported, the output filename must contain it so multi-volume works cannot collide. Authors: use credited publication authors, not people merely mentioned. Use at most three names; if more, append et al.' \
                     '6. Year: use a four-digit publication year supported by title/copyright/publication evidence. Ignore years from citations, examples, or historical discussion. If unavailable, use NA.' \
                     '7. ISBN: prefer ISBN-13, otherwise ISBN-10. Remove spaces and hyphens. If no ISBN is present, use NA inside the brackets.' \
                     '8. Transliterate accented Latin characters to plain ASCII when practical. Translate the title to English only when the source language is not English, French, or Spanish.' \
-                    '9. Do not surround the answer with quotation marks. Do not include slash characters in the filename.' \
+                    '9. Between title and authors, use exactly space-hyphen-space: " - ". Never use a slash as that separator. Do not surround the answer with quotation marks or include slash characters.' \
                     '10. If page images are attached, inspect them as high-priority visual evidence, especially title, copyright, publisher, author, volume, and ISBN details.' \
                     '' \
                     'SOURCE FILENAME - WEAK HINT ONLY; DOCUMENT EVIDENCE WINS' \
@@ -978,10 +1039,12 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 new_name=$(jq -r '.choices[0].message.content // empty' "$temp_response_file" 2>/dev/null)
                 rm -f "$temp_response_file" >/dev/null 2>&1
                 new_name=$(clean_file_name "$new_name")
+                new_name=$(ensure_source_volume "$new_name" "$filename")
+                primary_candidate="$new_name"
                 echo "Parsed name: $new_name" >>"$LOG_FILE"
                 accepted_name=""
                 if accepted_name=$(accept_first_pass_candidate "$new_name"); then
-                    new_name="$accepted_name"
+                    new_name=$(ensure_source_volume "$accepted_name" "$filename")
                     to_skip=false
                     break
                 fi
@@ -989,10 +1052,25 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 # Fallback extraction for non-standard payloads
                 new_name=$(echo "$LLM_RESPONSE" | sed -n 's/.*"content":"\\"\(.*\)\\"".*/\1/p')
                 new_name=$(clean_file_name "$new_name")
+                new_name=$(ensure_source_volume "$new_name" "$filename")
                 echo "Sed output: $new_name" >>"$LOG_FILE"
                 accepted_name=""
                 if accepted_name=$(accept_first_pass_candidate "$new_name"); then
-                    new_name="$accepted_name"
+                    new_name=$(ensure_source_volume "$accepted_name" "$filename")
+                    to_skip=false
+                    break
+                fi
+
+                # If the model omits required fields but the existing filename already
+                # contains a complete bibliographic name, prefer that deterministic
+                # evidence rather than treating a successful HTTP response as a total
+                # failure. This is intentionally limited to source names that can be
+                # normalized into the same strict final format without guessing.
+                source_candidate="${filename%.*}"
+                source_fallback=""
+                if source_fallback=$(deterministic_candidate_cleanup "$source_candidate" 2>/dev/null) && strict_response_format "$source_fallback"; then
+                    echo "Using deterministic source-filename fallback after invalid model output: $source_fallback" | tee -a "$LOG_FILE"
+                    new_name="$source_fallback"
                     to_skip=false
                     break
                 fi
@@ -1003,7 +1081,10 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                     break
                 fi
 
-                echo -e "${BRED}Invalid model response on attempt $retry: HTTP 200 was returned, but the response could not be converted to the required 'Title - Author(s) (Year) [ISBN]' format.${NC}" | tee -a "$LOG_FILE"
+                diagnostic_candidate="$new_name"
+                [[ -n "$diagnostic_candidate" ]] || diagnostic_candidate="$primary_candidate"
+                format_issue=$(response_format_issue "$diagnostic_candidate")
+                echo -e "${BRED}Model output validation failed on attempt $retry (HTTP 200): $format_issue. Parsed output: '$diagnostic_candidate'.${NC}" | tee -a "$LOG_FILE"
                 echo "Retrying in ${API_RETRY_DELAY_SECONDS}s." | tee -a "$LOG_FILE"
                 ((retry++))
                 sleep "$API_RETRY_DELAY_SECONDS"
