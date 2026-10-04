@@ -1,8 +1,17 @@
 PROJ_DIR="/.../rename-ebooks"                  # Replace with the actual path to your project directory
 API_ENDPOINT="https://.../v1/chat/completions" # Replace with your actual API endpoint
 MODEL="gpt-4.1"                                # Replace with your desired model
+API_KEY=""                                     # Replace when your endpoint requires authentication
+
+# LLM extraction features
+ENABLE_CRITIC=true
+ENABLE_MULTIMODAL=true
+MULTIMODAL_MAX_IMAGES=3
+MULTIMODAL_SCAN_PAGES=8
+MULTIMODAL_IMAGE_DPI=110
+MULTIMODAL_NONWHITE_FRACTION=0.001
 
 # API retry/timeout tuning
-API_TIMEOUT_SECONDS=60
+API_TIMEOUT_SECONDS=120
 API_RETRY_DELAY_SECONDS=2
 MAX_INVALID_RESPONSE_RETRIES=3

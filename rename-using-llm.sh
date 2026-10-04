@@ -32,8 +32,8 @@ source "$SCRIPT_DIR/rename-using-llm.conf"
 INPUT_DIR="$1" # Directory containing the book files
 LOG_FILE="$PROJ_DIR/logs/rename_books_$$"
 LOG_FILE+="_${CURRENT_TIME}.log" # Log file for storing the output
-: "${API_TIMEOUT_SECONDS:=480}"         # Timeout for each API call
-: "${API_RETRY_DELAY_SECONDS:=3}"      # Delay before retrying transient API failures
+: "${API_TIMEOUT_SECONDS:=120}"         # Timeout for each API call
+: "${API_RETRY_DELAY_SECONDS:=2}"      # Delay before retrying transient API failures
 : "${MAX_INVALID_RESPONSE_RETRIES:=3}" # Invalid model responses before clear failure
 ORIGINALS_SUBDIR="Originals" # Directory to store copies of original files
 FAILED_SUBDIR="Failed"       # Directory to store renamed files
@@ -138,6 +138,67 @@ time_stop() {
 
     # Print results
     printf "API Usage:  Elapsed %.4fs    Total (mins) %02d:%02d\n" "$elapsed" "$minutes" "$seconds" | tee -a "$LOG_FILE"
+}
+
+curl_exit_reason() {
+    case "$1" in
+        5) printf '%s' "proxy hostname could not be resolved" ;;
+        6) printf '%s' "API hostname could not be resolved" ;;
+        7) printf '%s' "could not connect to the API endpoint" ;;
+        28) printf '%s' "request timed out after ${API_TIMEOUT_SECONDS}s" ;;
+        35) printf '%s' "TLS/SSL handshake failed" ;;
+        52) printf '%s' "API server returned an empty reply" ;;
+        56) printf '%s' "network receive failure" ;;
+        60) printf '%s' "TLS certificate verification failed" ;;
+        *) printf '%s' "curl transport error (exit $1)" ;;
+    esac
+}
+
+api_response_detail() {
+    local response_file="$1"
+    local detail=""
+
+    if [[ -s "$response_file" ]]; then
+        detail=$(jq -r '
+            if .error? then
+                if (.error | type) == "object" then
+                    (.error.message // .error.detail // (.error | tostring))
+                else
+                    (.error | tostring)
+                end
+            elif .message? then (.message | tostring)
+            elif .detail? then (.detail | tostring)
+            else empty
+            end
+        ' "$response_file" 2>/dev/null || true)
+
+        if [[ -z "$detail" ]]; then
+            detail=$(head -c 1200 "$response_file" | tr '\n\r\t' '   ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
+        fi
+    fi
+
+    printf '%s' "$detail"
+}
+
+report_api_failure() {
+    local context="$1"
+    local http_code="$2"
+    local curl_exit="$3"
+    local response_file="$4"
+    local reason detail message
+
+    if ((curl_exit != 0)); then
+        reason=$(curl_exit_reason "$curl_exit")
+    elif [[ -n "$http_code" && "$http_code" != "000" && "$http_code" != "200" ]]; then
+        reason="HTTP $http_code"
+    else
+        reason="API returned an error or malformed response"
+    fi
+
+    detail=$(api_response_detail "$response_file")
+    message="$context failed: $reason"
+    [[ -n "$detail" ]] && message+=" — $detail"
+    echo -e "${BRED}${message}${NC}" | tee -a "$LOG_FILE" >&2
 }
 
 ###############
@@ -582,13 +643,25 @@ critic_review_candidate() {
     rm -f "$payload_file"
 
     if ((curl_exit != 0)); then
-        echo "Critic API call failed/timed out (curl exit $curl_exit)." >>"$LOG_FILE"
+        report_api_failure "Critic API call" "$http_code" "$curl_exit" "$response_file"
         rm -f "$response_file"
         return 1
     fi
 
-    if [[ "$http_code" != "200" ]] || jq -e '.error' "$response_file" >/dev/null 2>&1; then
-        echo "Critic API failure (HTTP $http_code)." >>"$LOG_FILE"
+    if [[ "$http_code" != "200" ]]; then
+        report_api_failure "Critic API call" "$http_code" 0 "$response_file"
+        rm -f "$response_file"
+        return 1
+    fi
+
+    if ! jq -e . "$response_file" >/dev/null 2>&1; then
+        report_api_failure "Critic API response parsing" "$http_code" 0 "$response_file"
+        rm -f "$response_file"
+        return 1
+    fi
+
+    if jq -e '.error' "$response_file" >/dev/null 2>&1; then
+        report_api_failure "Critic API call" "$http_code" 0 "$response_file"
         rm -f "$response_file"
         return 1
     fi
@@ -667,23 +740,38 @@ echo "API Endpoint: $API_ENDPOINT" >>"$LOG_FILE"
 
 # Test API connection first
 echo "Testing API connection..." | tee -a "$LOG_FILE"
-TEST_RESPONSE=$(curl -s -X POST "$API_ENDPOINT" \
+test_response_file=$(mktemp)
+test_curl_exit=0
+test_payload=$(jq -n --arg model "$MODEL" '{model:$model,messages:[{role:"system",content:"Test connection."},{role:"user",content:"Reply with OK."}],temperature:0,max_tokens:8}')
+test_http_code=$(curl -sS --max-time "$API_TIMEOUT_SECONDS" -X POST "$API_ENDPOINT" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $API_KEY" \
-    -d '{
-        "model": "'"$MODEL"'",
-        "messages": [
-            {"role": "system", "content": "Test connection."},
-            {"role": "user", "content": "Hello"}
-        ],
-        "temperature": 0
-    }')
-if [[ "$TEST_RESPONSE" == *"error"* ]]; then
-    echo "API Connection Failed. Response: $TEST_RESPONSE" | tee -a "$LOG_FILE"
+    -d "$test_payload" \
+    -o "$test_response_file" \
+    -w "%{http_code}" 2>>"$LOG_FILE") || test_curl_exit=$?
+
+if ((test_curl_exit != 0)); then
+    report_api_failure "API connection test" "$test_http_code" "$test_curl_exit" "$test_response_file"
+    rm -f "$test_response_file"
     exit 1
-else
-    echo "API Connection Successful" | tee -a "$LOG_FILE"
 fi
+if [[ "$test_http_code" != "200" ]]; then
+    report_api_failure "API connection test" "$test_http_code" 0 "$test_response_file"
+    rm -f "$test_response_file"
+    exit 1
+fi
+if ! jq -e . "$test_response_file" >/dev/null 2>&1; then
+    report_api_failure "API connection test response parsing" "$test_http_code" 0 "$test_response_file"
+    rm -f "$test_response_file"
+    exit 1
+fi
+if jq -e '.error' "$test_response_file" >/dev/null 2>&1; then
+    report_api_failure "API connection test" "$test_http_code" 0 "$test_response_file"
+    rm -f "$test_response_file"
+    exit 1
+fi
+rm -f "$test_response_file"
+echo "API Connection Successful (HTTP $test_http_code)" | tee -a "$LOG_FILE"
 
 echo "Renamed files will remain in place." | tee -a "$LOG_FILE"
 echo "Log file: $LOG_FILE" | tee -a "$LOG_FILE"
@@ -844,7 +932,8 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 rm -f "$payload_file"
 
                 if ((curl_exit != 0)); then
-                    echo -e "${BRED}API call failed/timed out on attempt $retry (curl exit $curl_exit). Retrying in ${API_RETRY_DELAY_SECONDS}s.${NC}" >>"$LOG_FILE"
+                    report_api_failure "Metadata API call (attempt $retry)" "$http_code" "$curl_exit" "$temp_response_file"
+                    echo "Retrying in ${API_RETRY_DELAY_SECONDS}s." | tee -a "$LOG_FILE"
                     rm -f "$temp_response_file" >/dev/null 2>&1
                     ((retry++))
                     sleep "$API_RETRY_DELAY_SECONDS"
@@ -858,21 +947,29 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 echo "API Response (Attempt $retry): $LLM_RESPONSE" >>"$LOG_FILE"
 
                 if [[ "$http_code" =~ ^(400|401|403|404|422)$ ]]; then
-                    echo -e "${BRED}SKIPPING: Clear API failure (HTTP $http_code) on attempt $retry.${NC}" >>"$LOG_FILE"
+                    report_api_failure "Metadata API call (attempt $retry)" "$http_code" 0 "$temp_response_file"
+                    echo "Not retrying because this HTTP status usually indicates a request, configuration, or authentication problem." | tee -a "$LOG_FILE"
                     rm -f "$temp_response_file" >/dev/null 2>&1
                     break
                 fi
 
                 if [[ "$http_code" != "200" ]]; then
-                    echo -e "${BRED}Transient API HTTP $http_code on attempt $retry. Retrying in ${API_RETRY_DELAY_SECONDS}s.${NC}" >>"$LOG_FILE"
+                    report_api_failure "Metadata API call (attempt $retry)" "$http_code" 0 "$temp_response_file"
+                    echo "Retrying in ${API_RETRY_DELAY_SECONDS}s." | tee -a "$LOG_FILE"
                     rm -f "$temp_response_file" >/dev/null 2>&1
                     ((retry++))
                     sleep "$API_RETRY_DELAY_SECONDS"
                     continue
                 fi
 
+                if ! jq -e . "$temp_response_file" >/dev/null 2>&1; then
+                    report_api_failure "Metadata API response parsing (attempt $retry)" "$http_code" 0 "$temp_response_file"
+                    rm -f "$temp_response_file" >/dev/null 2>&1
+                    break
+                fi
+
                 if jq -e '.error' "$temp_response_file" >/dev/null 2>&1; then
-                    echo -e "${BRED}SKIPPING: Clear API error payload on attempt $retry: $LLM_RESPONSE.${NC}" >>"$LOG_FILE"
+                    report_api_failure "Metadata API call (attempt $retry)" "$http_code" 0 "$temp_response_file"
                     rm -f "$temp_response_file" >/dev/null 2>&1
                     break
                 fi
@@ -906,7 +1003,8 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                     break
                 fi
 
-                echo "Invalid model response on attempt $retry. Retrying in ${API_RETRY_DELAY_SECONDS}s." >>"$LOG_FILE"
+                echo -e "${BRED}Invalid model response on attempt $retry: HTTP 200 was returned, but the response could not be converted to the required 'Title - Author(s) (Year) [ISBN]' format.${NC}" | tee -a "$LOG_FILE"
+                echo "Retrying in ${API_RETRY_DELAY_SECONDS}s." | tee -a "$LOG_FILE"
                 ((retry++))
                 sleep "$API_RETRY_DELAY_SECONDS"
             done
