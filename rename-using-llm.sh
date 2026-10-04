@@ -12,6 +12,7 @@
 # Dependencies:
 # - jq
 # - pdftotext
+# - pdftoppm (when multimodal page images are enabled)
 # - ebook-convert
 # - python3
 #
@@ -41,6 +42,12 @@ EXTRACT_SENT_TO_LLM_LENGTH=10000 # Maximum source lines scanned for useful bibli
 : "${LLM_TAIL_LINES:=80}"        # End-of-sample lines included in the evidence packet
 : "${LLM_METADATA_LINES:=120}"   # Metadata-like lines included in the evidence packet
 : "${LLM_CONTEXT_CHARS:=16000}"  # Maximum characters sent as document evidence
+: "${ENABLE_CRITIC:=true}"
+: "${ENABLE_MULTIMODAL:=true}"
+: "${MULTIMODAL_MAX_IMAGES:=3}"
+: "${MULTIMODAL_SCAN_PAGES:=8}"
+: "${MULTIMODAL_IMAGE_DPI:=110}"
+: "${MULTIMODAL_NONWHITE_FRACTION:=0.001}"
 
 # Capture current date-time as YYYYMMDDHHMMSS.
 CURRENT_TIME=$(date +"%Y%m%d%H%M%S")
@@ -49,6 +56,13 @@ CURRENT_TIME=$(date +"%Y%m%d%H%M%S")
 NC='\033[0m'
 BRED='\033[1;91m'
 BGREEN='\033[1;92m'
+
+feature_enabled() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 if [ -z "$INPUT_DIR" ]; then
     echo -e "${BRED}Error: No input directory provided.${NC}"
@@ -69,6 +83,10 @@ if ! command -v jq &>/dev/null; then
 fi
 if ! command -v pdftotext &>/dev/null || ! command -v ebook-convert &>/dev/null; then
     echo "Error: Required tools 'pdftotext' or 'ebook-convert' are not installed. Install with: sudo apt install poppler-utils calibre" | tee -a "$LOG_FILE"
+    exit 1
+fi
+if feature_enabled "$ENABLE_MULTIMODAL" && ! command -v pdftoppm &>/dev/null; then
+    echo "Error: 'pdftoppm' is required when ENABLE_MULTIMODAL=true. Install with: sudo apt install poppler-utils" | tee -a "$LOG_FILE"
     exit 1
 fi
 
@@ -285,6 +303,135 @@ fix_legacy_possessive_filename() {
     echo "$stem" | sed -E "s/([[:alpha:]][[:alpha:]]+) s ([[:alpha:]])/\\1's \\2/g"
 }
 
+MULTIMODAL_WORK_DIR=""
+MULTIMODAL_IMAGE_FILES=()
+
+cleanup_multimodal_images() {
+    if [[ -n "$MULTIMODAL_WORK_DIR" && -d "$MULTIMODAL_WORK_DIR" ]]; then
+        rm -rf "$MULTIMODAL_WORK_DIR"
+    fi
+    MULTIMODAL_WORK_DIR=""
+    MULTIMODAL_IMAGE_FILES=()
+}
+
+prepare_multimodal_images() {
+    local source_file="$1"
+    local extension="$2"
+    local pdf_source="$source_file"
+    local scan_prefix pgm page_token page_number jpeg_root jpeg_file
+
+    cleanup_multimodal_images
+    feature_enabled "$ENABLE_MULTIMODAL" || return 0
+    MULTIMODAL_WORK_DIR=$(mktemp -d)
+
+    if [[ "$extension" != "pdf" ]]; then
+        pdf_source="$MULTIMODAL_WORK_DIR/source.pdf"
+        if ! ebook-convert "$source_file" "$pdf_source" >/dev/null 2>>"$LOG_FILE"; then
+            echo "Multimodal extraction unavailable: conversion to PDF failed." >>"$LOG_FILE"
+            return 0
+        fi
+    fi
+
+    scan_prefix="$MULTIMODAL_WORK_DIR/scan"
+    if ! pdftoppm -f 1 -l "$MULTIMODAL_SCAN_PAGES" -r 30 -gray "$pdf_source" "$scan_prefix" >/dev/null 2>>"$LOG_FILE"; then
+        echo "Multimodal extraction unavailable: initial page scan failed." >>"$LOG_FILE"
+        return 0
+    fi
+
+    for pgm in "$MULTIMODAL_WORK_DIR"/scan-*.pgm; do
+        [[ -f "$pgm" ]] || continue
+        if ! python3 - "$pgm" "$MULTIMODAL_NONWHITE_FRACTION" <<'PY'
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_bytes()
+minimum = float(sys.argv[2])
+pos = 0
+
+def token():
+    global pos
+    while pos < len(raw):
+        if raw[pos:pos+1] == b"#":
+            end = raw.find(b"\n", pos)
+            pos = len(raw) if end < 0 else end + 1
+            continue
+        if raw[pos] in b" \t\r\n":
+            pos += 1
+            continue
+        break
+    start = pos
+    while pos < len(raw) and raw[pos] not in b" \t\r\n#":
+        pos += 1
+    return raw[start:pos]
+
+if token() != b"P5":
+    raise SystemExit(1)
+width, height, maximum = int(token()), int(token()), int(token())
+while pos < len(raw) and raw[pos] in b" \t\r\n":
+    pos += 1
+pixels = raw[pos:pos + width * height]
+if not pixels or maximum <= 0:
+    raise SystemExit(1)
+cutoff = maximum * 0.96
+fraction = sum(value < cutoff for value in pixels) / len(pixels)
+raise SystemExit(0 if fraction >= minimum else 1)
+PY
+        then
+            continue
+        fi
+
+        page_token="${pgm##*-}"
+        page_token="${page_token%.pgm}"
+        page_number=$((10#$page_token))
+        jpeg_root="$MULTIMODAL_WORK_DIR/page-$page_number"
+        jpeg_file="$jpeg_root.jpg"
+        if pdftoppm -f "$page_number" -l "$page_number" -singlefile -jpeg -r "$MULTIMODAL_IMAGE_DPI" "$pdf_source" "$jpeg_root" >/dev/null 2>>"$LOG_FILE" \
+            && [[ -s "$jpeg_file" ]]; then
+            MULTIMODAL_IMAGE_FILES+=("$jpeg_file")
+            if ((${#MULTIMODAL_IMAGE_FILES[@]} >= MULTIMODAL_MAX_IMAGES)); then
+                break
+            fi
+        fi
+    done
+
+    echo "Multimodal evidence: ${#MULTIMODAL_IMAGE_FILES[@]} initial non-blank page image(s)." >>"$LOG_FILE"
+}
+
+build_extraction_payload() {
+    local output_file="$1"
+    local system_prompt="$2"
+    local user_prompt="$3"
+    shift 3
+
+    python3 - "$output_file" "$MODEL" "$system_prompt" "$user_prompt" "$@" <<'PY'
+import base64
+import json
+import sys
+from pathlib import Path
+
+output = Path(sys.argv[1])
+model, system_prompt, user_prompt = sys.argv[2:5]
+images = [Path(p) for p in sys.argv[5:]]
+if images:
+    content = [{"type": "text", "text": user_prompt}]
+    for image in images:
+        data = base64.b64encode(image.read_bytes()).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}})
+else:
+    content = user_prompt
+payload = {
+    "model": model,
+    "messages": [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": content},
+    ],
+    "temperature": 0.1,
+    "max_tokens": 256,
+}
+output.write_text(json.dumps(payload), encoding="utf-8")
+PY
+}
+
 ###############
 # This function checks if a given response
 # (passed as an argument) is valid. The function evaluates the input string
@@ -306,9 +453,80 @@ good_response() {
 }
 
 strict_response_format() {
-    # Final acceptance check after the critic pass.
+    # Final acceptance check after the critic/fallback pass.
     local new_name="$1"
+
+    [[ -n "$new_name" ]] || return 1
+    [[ "$new_name" != *$'\n'* && "$new_name" != *$'\r'* ]] || return 1
+    [[ "$new_name" != */* ]] || return 1
+
     [[ "$new_name" =~ ^.+[[:space:]]-[[:space:]].+[[:space:]]\(([0-9]{4}|NA)\)[[:space:]]\[([0-9]{13}|[0-9]{9}[0-9Xx]|NA)\]$ ]]
+}
+
+deterministic_candidate_cleanup() {
+    local candidate
+    candidate=$(clean_file_name "$1")
+
+    python3 - "$candidate" <<'PY'
+import re
+import sys
+
+candidate = sys.argv[1].strip()
+match = re.fullmatch(r"(.+?)\s+-\s+(.+?)\s+\(([^()]*)\)\s+\[([^\[\]]*)\]", candidate)
+if not match:
+    raise SystemExit(1)
+title, authors, year, isbn = (part.strip() for part in match.groups())
+if not title or not authors:
+    raise SystemExit(1)
+year = year.upper()
+if year != "NA" and not re.fullmatch(r"\d{4}", year):
+    raise SystemExit(1)
+isbn = re.sub(r"(?i)^ISBN(?:-1[03])?:?\s*", "", isbn)
+isbn = re.sub(r"[\s-]+", "", isbn).upper()
+if isbn != "NA" and not (re.fullmatch(r"\d{13}", isbn) or re.fullmatch(r"\d{9}[\dX]", isbn)):
+    raise SystemExit(1)
+
+small = {"a", "an", "and", "as", "at", "but", "by", "for", "in", "nor", "of", "on", "or", "per", "the", "to", "via", "vs", "with"}
+word_re = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
+words = list(word_re.finditer(title))
+first = words[0].start() if words else -1
+last = words[-1].start() if words else -1
+
+def title_word(match):
+    word = match.group(0)
+    low = word.lower()
+    if match.start() not in {first, last} and low in small:
+        return low
+    if re.fullmatch(r"[ivxlcdm]+", low):
+        return low.upper()
+    if word.isupper() and 2 <= len(word) <= 4 and low not in small:
+        return word
+    return low[:1].upper() + low[1:]
+
+title = word_re.sub(title_word, title)
+print(f"{title} - {authors} ({year}) [{isbn}]")
+PY
+}
+
+accept_first_pass_candidate() {
+    local candidate="$1"
+    local reviewed=""
+
+    good_response "$candidate" || return 1
+    if feature_enabled "$ENABLE_CRITIC"; then
+        if reviewed=$(critic_review_candidate "$candidate"); then
+            printf '%s\n' "$reviewed"
+            return 0
+        fi
+        echo "Critic failed; falling back to deterministic cleanup of first-pass candidate." >>"$LOG_FILE"
+    fi
+
+    if reviewed=$(deterministic_candidate_cleanup "$candidate") && strict_response_format "$reviewed"; then
+        echo "Using deterministic first-pass fallback: $reviewed" >>"$LOG_FILE"
+        printf '%s\n' "$reviewed"
+        return 0
+    fi
+    return 1
 }
 
 ###############
@@ -377,6 +595,14 @@ critic_review_candidate() {
 
     reviewed_name=$(jq -r '.choices[0].message.content // empty' "$response_file" 2>/dev/null)
     rm -f "$response_file"
+
+    # The critic is required to emit exactly one line. Reject embedded line
+    # breaks rather than silently flattening explanatory or multi-answer text.
+    if [[ "$reviewed_name" == *$'\n'* || "$reviewed_name" == *$'\r'* ]]; then
+        echo "Critic rejected: response contained multiple lines." >>"$LOG_FILE"
+        return 1
+    fi
+
     reviewed_name=$(clean_file_name "$reviewed_name")
     echo "Critic reviewed name: $reviewed_name" >>"$LOG_FILE"
 
@@ -544,8 +770,12 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
             continue
         fi
 
-        # Check for empty text file and handle errors
-        if [ ! -s "$temp_file" ]; then
+        # Text extraction may be blank for scanned/image-only publications. When
+        # multimodal evidence is enabled, initial page images can still identify them.
+        text_has_content=false
+        if grep -q '[^[:space:]]' "$temp_file" 2>/dev/null; then
+            text_has_content=true
+        elif ! feature_enabled "$ENABLE_MULTIMODAL"; then
             echo -e "${BRED}SKIPPING: Failed to extract text from: $file.${NC}" | tee -a "$LOG_FILE"
             rm -f "$temp_file"
             mv -f "$file" "$failed_dir/$filename" >>"$LOG_FILE" 2>&1
@@ -553,11 +783,10 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
         fi
 
         extracted_text=$(prepare_llm_text "$temp_file")
-        # echo "Extracted text: $extracted_text"
+        prepare_multimodal_images "$file" "$extension"
         new_name=""
         to_skip=true
-        check_blank=$(printf '%s' "$extracted_text" | tr -d '[:space:]')
-        if [ -n "$check_blank" ]; then
+        if [[ "$text_has_content" == true ]] || ((${#MULTIMODAL_IMAGE_FILES[@]} > 0)); then
 
             retry=1
             invalid_response_retries=0
@@ -588,6 +817,7 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                     '7. ISBN: prefer ISBN-13, otherwise ISBN-10. Remove spaces and hyphens. If no ISBN is present, use NA inside the brackets.' \
                     '8. Transliterate accented Latin characters to plain ASCII when practical. Translate the title to English only when the source language is not English, French, or Spanish.' \
                     '9. Do not surround the answer with quotation marks. Do not include slash characters in the filename.' \
+                    '10. If page images are attached, inspect them as high-priority visual evidence, especially title, copyright, publisher, author, volume, and ISBN details.' \
                     '' \
                     'SOURCE FILENAME - WEAK HINT ONLY; DOCUMENT EVIDENCE WINS' \
                     "$filename" \
@@ -597,10 +827,7 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                     'END DOCUMENT EVIDENCE'
 
                 payload_file=$(mktemp)
-                jq -n --arg model "$MODEL" \
-                    --arg system "$system_prompt" \
-                    --arg user "$user_prompt" \
-                    '{model:$model, messages:[{role:"system",content:$system},{role:"user",content:$user}], temperature:0.1, max_tokens:256}' > "$payload_file"
+                build_extraction_payload "$payload_file" "$system_prompt" "$user_prompt" "${MULTIMODAL_IMAGE_FILES[@]}"
 
                 echo "Executing curl with payload in $payload_file" >>"$LOG_FILE"
 
@@ -655,26 +882,22 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 rm -f "$temp_response_file" >/dev/null 2>&1
                 new_name=$(clean_file_name "$new_name")
                 echo "Parsed name: $new_name" >>"$LOG_FILE"
-                if good_response "$new_name"; then
-                    critic_name=""
-                    if critic_name=$(critic_review_candidate "$new_name"); then
-                        new_name="$critic_name"
-                        to_skip=false
-                        break
-                    fi
+                accepted_name=""
+                if accepted_name=$(accept_first_pass_candidate "$new_name"); then
+                    new_name="$accepted_name"
+                    to_skip=false
+                    break
                 fi
 
                 # Fallback extraction for non-standard payloads
                 new_name=$(echo "$LLM_RESPONSE" | sed -n 's/.*"content":"\\"\(.*\)\\"".*/\1/p')
                 new_name=$(clean_file_name "$new_name")
                 echo "Sed output: $new_name" >>"$LOG_FILE"
-                if good_response "$new_name"; then
-                    critic_name=""
-                    if critic_name=$(critic_review_candidate "$new_name"); then
-                        new_name="$critic_name"
-                        to_skip=false
-                        break
-                    fi
+                accepted_name=""
+                if accepted_name=$(accept_first_pass_candidate "$new_name"); then
+                    new_name="$accepted_name"
+                    to_skip=false
+                    break
                 fi
 
                 ((invalid_response_retries++))
@@ -688,6 +911,8 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 sleep "$API_RETRY_DELAY_SECONDS"
             done
         fi
+
+        cleanup_multimodal_images
 
         if [ "$to_skip" = true ]; then
             echo "SKIPPING: No match found." | tee -a "$LOG_FILE"
