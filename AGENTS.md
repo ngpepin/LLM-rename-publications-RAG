@@ -23,7 +23,7 @@ The current primary workflow is the Bash implementation. The older LangChain imp
 
 ## Canonical Filename Contract
 
-The LLM workflow must converge on this bibliographic structure:
+The LLM workflow must converge on this bibliographic structure, with the publication title normalized to conventional English Title Case:
 
 ```text
 Title - Author(s) (YYYY|NA) [ISBN|NA]

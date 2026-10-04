@@ -28,7 +28,7 @@ For normal use, start with the repository launcher:
 
 ## Canonical Filename Format
 
-The LLM workflow targets:
+The LLM workflow targets conventional English Title Case for the publication title and the canonical structure:
 
 ```text
 Title - Author(s) (YYYY|NA) [ISBN|NA].ext

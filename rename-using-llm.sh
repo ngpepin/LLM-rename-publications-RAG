@@ -932,11 +932,51 @@ else:
 PY
 }
 
+enforce_title_case_candidate() {
+    # Enforce title case on the title portion of every accepted bibliographic
+    # filename, regardless of whether it came from the model, critic, or a
+    # deterministic fallback. Author names and trailing metadata are untouched.
+    local candidate="$1"
+
+    python3 - "$candidate" <<'PY'
+import re
+import sys
+
+candidate = sys.argv[1].strip()
+match = re.fullmatch(r"(.+)\s+-\s+(.+?)\s+\((\d{4}|NA)\)\s+\[([^\[\]]+)\]", candidate, flags=re.IGNORECASE)
+if not match:
+    print(candidate)
+    raise SystemExit(0)
+
+title, authors, year, isbn = (part.strip() for part in match.groups())
+small = {"a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into", "nor", "of", "on", "onto", "or", "per", "the", "to", "via", "vs", "with"}
+word_re = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
+words = list(word_re.finditer(title))
+first = words[0].start() if words else -1
+last = words[-1].start() if words else -1
+
+def title_word(match):
+    word = match.group(0)
+    low = word.lower()
+    if match.start() not in {first, last} and low in small:
+        return low
+    if re.fullmatch(r"[ivxlcdm]+", low):
+        return low.upper()
+    # Preserve short all-caps initialisms/acronyms such as AI, RAG, SQL, API.
+    if word.isupper() and 2 <= len(word) <= 5 and low not in small:
+        return word
+    return low[:1].upper() + low[1:]
+
+title = word_re.sub(title_word, title)
+print(f"{title} - {authors} ({year.upper()}) [{isbn}]")
+PY
+}
+
 deterministic_candidate_cleanup() {
     local candidate
     candidate=$(clean_file_name "$1")
 
-    python3 - "$candidate" <<'PY'
+    candidate=$(python3 - "$candidate" <<'PY'
 import re
 import sys
 
@@ -957,27 +997,11 @@ isbn = re.sub(r"(?i)^ISBN(?:-1[03])?:?\s*", "", isbn)
 isbn = re.sub(r"[\s-]+", "", isbn).upper()
 if isbn != "NA" and not (re.fullmatch(r"\d{13}", isbn) or re.fullmatch(r"\d{9}[\dX]", isbn)):
     raise SystemExit(1)
-
-small = {"a", "an", "and", "as", "at", "but", "by", "for", "in", "nor", "of", "on", "or", "per", "the", "to", "via", "vs", "with"}
-word_re = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
-words = list(word_re.finditer(title))
-first = words[0].start() if words else -1
-last = words[-1].start() if words else -1
-
-def title_word(match):
-    word = match.group(0)
-    low = word.lower()
-    if match.start() not in {first, last} and low in small:
-        return low
-    if re.fullmatch(r"[ivxlcdm]+", low):
-        return low.upper()
-    if word.isupper() and 2 <= len(word) <= 4 and low not in small:
-        return word
-    return low[:1].upper() + low[1:]
-
-title = word_re.sub(title_word, title)
 print(f"{title} - {authors} ({year}) [{isbn}]")
 PY
+) || return 1
+
+    enforce_title_case_candidate "$candidate"
 }
 
 accept_first_pass_candidate() {
@@ -1025,7 +1049,7 @@ critic_review_candidate() {
         '' \
         'REQUIREMENTS' \
         '1. Return exactly one line and nothing else.' \
-        '2. Preserve all bibliographic facts already present; correct formatting only. Never remove an edition designation (First Edition, 2nd Edition, Third Edition, etc.) or a volume designation such as Volume 1, Volume 2, Vol. 3, or a Roman-numeral volume.' \
+        '2. Preserve all bibliographic facts already present; correct formatting only. Put the title itself in conventional English Title Case. Never remove an edition designation (First Edition, 2nd Edition, Third Edition, etc.) or a volume designation such as Volume 1, Volume 2, Vol. 3, or a Roman-numeral volume.' \
         '3. Treat explicit edition and volume designations as part of the title so different editions/volumes remain distinguishable. Title and author fields must be non-empty. The separator between them MUST be exactly space-hyphen-space: " - ". Replace a slash separator or a cover-style "by Author" credit with " - Author"; never use "by" to denote the author.' \
         '4. Year must be exactly four digits or NA.' \
         '5. ISBN must be ISBN-13 (13 digits), ISBN-10 (10 characters, final X allowed), or NA. Remove ISBN spaces and hyphens.' \
@@ -1310,7 +1334,7 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                     '1. Output one line only. No quotes, labels, markdown, commentary, JSON, XML, reasoning, or <think> text.' \
                     '2. Use only the supplied evidence. Do not browse, guess, or invent missing metadata.' \
                     '3. Evidence priority: title/copyright pages and explicit ISBN/publisher/edition/volume lines > source filename edition/volume hints > table of contents/headings > body references. If edition sources conflict, an explicit standalone front-matter edition line wins over the source filename, and both win over an unsupported model guess.' \
-                    '4. Title: use the publication title. ALWAYS include a clearly identified EDITION for a specific edition (for example First Edition, 2nd Edition, Third Edition, 4th Ed.) and a clearly identified volume designation for an individual volume. Normalize edition wording to "First Edition", "Second Edition", "Third Edition", etc. when practical, and volume wording to "Volume N" when practical. Treat both edition and volume as part of the title. Never drop them when supported by the evidence.' \
+                    '4. Title: use the publication title in conventional English Title Case. ALWAYS include a clearly identified EDITION for a specific edition (for example First Edition, 2nd Edition, Third Edition, 4th Ed.) and a clearly identified volume designation for an individual volume. Normalize edition wording to "First Edition", "Second Edition", "Third Edition", etc. when practical, and volume wording to "Volume N" when practical. Treat both edition and volume as part of the title. Never drop them when supported by the evidence.' \
                     '5. Before answering, explicitly check the title page, cover, copyright information, revision-history/front-matter lines, headers, and source filename for EDITION and volume information. If a specific edition or individual volume is supported, the output filename MUST contain it so different editions or volumes cannot collide. Authors: use credited publication authors, not people merely mentioned. Use at most three names; if more, append et al.' \
                     '6. Year: use a four-digit publication year supported by title/copyright/publication evidence. A copyright line for the identified edition is strong evidence. Ignore years from citations, examples, historical discussion, or references. If unavailable, use NA. The year MUST appear in its own parentheses immediately before the ISBN.' \
                     '7. ISBN: prefer ISBN-13, otherwise ISBN-10. Remove spaces and hyphens. Put the ISBN ONLY inside square brackets at the end; never put ISBN in parentheses where the year belongs. If no ISBN is present, use NA inside the brackets.' \
@@ -1423,6 +1447,24 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 # failure. This is intentionally limited to source names that can be
                 # normalized into the same strict final format without guessing.
                 source_candidate="${filename%.*}"
+                # Download managers and file copies often append a duplicate marker
+                # such as " (2)" or "_1" after an otherwise complete canonical
+                # bibliographic filename.  That marker is not book metadata and must
+                # not prevent the deterministic source-filename fallback from working.
+                source_candidate=$(python3 - "$source_candidate" <<'PY'
+import re
+import sys
+
+candidate = sys.argv[1].strip()
+# Strip a trailing copy/index marker only when it follows a bracketed metadata
+# field, which keeps ordinary numeric parentheses/underscores in real titles safe.
+if re.search(r"\]\s+(?:\(\d+\))$", candidate):
+    candidate = re.sub(r"\s+\(\d+\)$", "", candidate)
+elif re.search(r"\]_\d+$", candidate):
+    candidate = re.sub(r"_\d+$", "", candidate)
+print(candidate)
+PY
+)
                 source_fallback=""
                 if source_fallback=$(deterministic_candidate_cleanup "$source_candidate" 2>/dev/null) && strict_response_format "$source_fallback"; then
                     echo "Using deterministic source-filename fallback after invalid model output: $source_fallback" | tee -a "$LOG_FILE"
@@ -1474,6 +1516,7 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
             ###############
 
             new_name=$(clean_file_name "$new_name")
+            new_name=$(enforce_title_case_candidate "$new_name")
             old_file="$file"
             old_filepath=$(dirname "$file")
             old_filename=$(basename -- "$file")
