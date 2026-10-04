@@ -582,6 +582,84 @@ response_format_issue() {
     fi
 }
 
+repair_candidate_from_evidence() {
+    # Repair a common small-model near miss: the model identifies title/author
+    # correctly but emits ISBN as a parenthetical and omits the publication year.
+    # Only use explicit bibliographic evidence; never infer a year from context.
+    local candidate="$1"
+    local evidence="$2"
+
+    python3 - "$candidate" "$evidence" <<'PY'
+import re
+import sys
+
+candidate = sys.argv[1].strip()
+evidence = sys.argv[2]
+
+if " - " not in candidate:
+    print(candidate)
+    raise SystemExit(0)
+
+# If already strict-looking, leave it alone.
+if re.fullmatch(r".+\s+-\s+.+\s+\((?:\d{4}|NA)\)\s+\[(?:\d{13}|\d{9}[\dXx]|NA)\]", candidate):
+    print(candidate)
+    raise SystemExit(0)
+
+def normalize_isbn(value):
+    value = re.sub(r"(?i)^ISBN(?:-1[03])?:?\s*", "", value or "")
+    value = re.sub(r"[\s-]+", "", value).upper()
+    if re.fullmatch(r"\d{13}|\d{9}[\dX]", value):
+        return value
+    return ""
+
+isbn = ""
+# Prefer an ISBN the model actually returned, even when it put it in ().
+for pattern in (
+    r"(?i)\(\s*ISBN(?:-1[03])?:?\s*([0-9Xx][0-9Xx\s-]{8,})\s*\)\s*$",
+    r"(?i)\[\s*ISBN(?:-1[03])?:?\s*([0-9Xx][0-9Xx\s-]{8,})\s*\]\s*$",
+):
+    m = re.search(pattern, candidate)
+    if m:
+        isbn = normalize_isbn(m.group(1))
+        if isbn:
+            candidate = candidate[:m.start()].rstrip(" ,;:-")
+            break
+
+if not isbn:
+    for m in re.finditer(r"(?im)\bISBN(?:-1[03])?\s*:?\s*([0-9Xx][0-9Xx\s-]{8,})", evidence):
+        isbn = normalize_isbn(m.group(1))
+        if isbn:
+            break
+
+# Prefer explicit copyright/publication evidence for the edition year.
+year = ""
+year_patterns = (
+    r"(?im)\bcopyright\s*(?:©|\(c\)|c)?\s*(20\d{2}|19\d{2})\b",
+    r"(?im)^\s*(?:first\s+release|publication\s+date|published)\s*:?\s*(20\d{2}|19\d{2})\b",
+    r"(?im)^\s*(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+(20\d{2}|19\d{2})\s*:?\s*$",
+)
+for pattern in year_patterns:
+    m = re.search(pattern, evidence)
+    if m:
+        year = m.group(1)
+        break
+
+if not year:
+    year = "NA"
+if not isbn:
+    isbn = "NA"
+
+# Avoid manufacturing a repair unless the candidate still has a usable title/author split.
+title, authors = candidate.split(" - ", 1)
+title = title.strip()
+authors = authors.strip()
+if not title or not authors:
+    print(sys.argv[1].strip())
+else:
+    print(f"{title} - {authors} ({year}) [{isbn}]")
+PY
+}
+
 deterministic_candidate_cleanup() {
     local candidate
     candidate=$(clean_file_name "$1")
@@ -962,8 +1040,8 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                     '3. Evidence priority: title/copyright pages and explicit ISBN/publisher/volume lines > table of contents/headings > body references. The source filename may be used as supporting evidence for an explicit volume number when document evidence does not contradict it.' \
                     '4. Title: use the publication title. ALWAYS include a clearly identified volume designation for an individual volume (for example Volume 1, Volume 2, Vol. 3, or Volume IV), normalizing it to "Volume N" when practical. Treat the volume designation as part of the title. Do not drop it even when all volumes otherwise share the same title, authors, year, or ISBN.' \
                     '5. Before answering, explicitly check the title page, cover, copyright information, headers, and source filename for volume information. If an individual volume number is supported, the output filename must contain it so multi-volume works cannot collide. Authors: use credited publication authors, not people merely mentioned. Use at most three names; if more, append et al.' \
-                    '6. Year: use a four-digit publication year supported by title/copyright/publication evidence. Ignore years from citations, examples, or historical discussion. If unavailable, use NA.' \
-                    '7. ISBN: prefer ISBN-13, otherwise ISBN-10. Remove spaces and hyphens. If no ISBN is present, use NA inside the brackets.' \
+                    '6. Year: use a four-digit publication year supported by title/copyright/publication evidence. A copyright line for the identified edition is strong evidence. Ignore years from citations, examples, historical discussion, or references. If unavailable, use NA. The year MUST appear in its own parentheses immediately before the ISBN.' \
+                    '7. ISBN: prefer ISBN-13, otherwise ISBN-10. Remove spaces and hyphens. Put the ISBN ONLY inside square brackets at the end; never put ISBN in parentheses where the year belongs. If no ISBN is present, use NA inside the brackets.' \
                     '8. Transliterate accented Latin characters to plain ASCII when practical. Translate the title to English only when the source language is not English, French, or Spanish.' \
                     '9. Between title and authors, use exactly space-hyphen-space: " - ". Never use a slash as that separator. Do not surround the answer with quotation marks or include slash characters.' \
                     '10. If page images are attached, inspect them as high-priority visual evidence, especially title, copyright, publisher, author, volume, and ISBN details.' \
@@ -1040,6 +1118,7 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 rm -f "$temp_response_file" >/dev/null 2>&1
                 new_name=$(clean_file_name "$new_name")
                 new_name=$(ensure_source_volume "$new_name" "$filename")
+                new_name=$(repair_candidate_from_evidence "$new_name" "$extracted_text")
                 primary_candidate="$new_name"
                 echo "Parsed name: $new_name" >>"$LOG_FILE"
                 accepted_name=""
@@ -1053,6 +1132,7 @@ find "$INPUT_DIR" -type f \( -iname "*.pdf" -o -iname "*.epub" -o -iname "*.chm"
                 new_name=$(echo "$LLM_RESPONSE" | sed -n 's/.*"content":"\\"\(.*\)\\"".*/\1/p')
                 new_name=$(clean_file_name "$new_name")
                 new_name=$(ensure_source_volume "$new_name" "$filename")
+                new_name=$(repair_candidate_from_evidence "$new_name" "$extracted_text")
                 echo "Sed output: $new_name" >>"$LOG_FILE"
                 accepted_name=""
                 if accepted_name=$(accept_first_pass_candidate "$new_name"); then
