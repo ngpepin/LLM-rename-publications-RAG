@@ -48,19 +48,19 @@ The canonical author separator is ` - `.
 Do **not** use cover-style `by Author` syntax for the author field. For example:
 
 ```text
-A Great Book by Jane Smith (2024) [9781234567890]
+A Great Book by Jane Smith (2024) [9780306406157]
 ```
 
 normalizes to:
 
 ```text
-A Great Book - Jane Smith (2024) [9781234567890]
+A Great Book - Jane Smith (2024) [9780306406157]
 ```
 
 The normalization is context-sensitive rather than global. Legitimate title text containing the word `by` is preserved:
 
 ```text
-Learn by Doing - Jane Smith (2024) [9781234567890]
+Learn by Doing - Jane Smith (2024) [9780306406157]
 ```
 
 A title may also contain earlier ` - ` separators. The workflow treats the **final** bibliographic ` - ` as the title/author boundary.
@@ -231,18 +231,46 @@ The endpoint must be compatible with the OpenAI chat-completions request/respons
 
 ### LLM extraction and validation features
 
-Current feature switches include:
+Extraction defaults include:
 
 ```bash
-ENABLE_CRITIC=true
+LLM_RESPONSE_FORMAT=json_schema
+LLM_TEMPERATURE=0
+LLM_MAX_TOKENS=1024
+LLM_MAX_OUTPUT_TOKENS=2048
+LLM_SEED=""
+LLM_REASONING_EFFORT=""
+LLM_EXPECTED_CONTEXT_TOKENS=0
+LOG_MODEL_METADATA=false
 ENABLE_MULTIMODAL=true
+MULTIMODAL_INITIAL_IMAGES=3
 MULTIMODAL_MAX_IMAGES=3
 MULTIMODAL_SCAN_PAGES=8
 MULTIMODAL_IMAGE_DPI=110
 MULTIMODAL_NONWHITE_FRACTION=0.001
 ```
 
-When multimodal mode is enabled, `pdftoppm` is required. PDF inputs are scanned directly. EPUB, MOBI, and CHM inputs are first converted to a temporary PDF for page-image extraction; for EPUB specifically, if that temporary PDF conversion fails, the script falls back to selected embedded EPUB images (prioritizing declared cover artwork) so multimodal evidence can still be supplied.
+`json_schema` requests constrained JSON with separate bibliographic fields, the original title/language, and evidence-source citations. The script verifies this contract on synthetic evidence before touching books. Use `json_object` explicitly for servers that support JSON mode but not schemas, or `text` for legacy endpoints; text mode still receives deterministic cleanup and factual checks. There is no critic phase. The old `ENABLE_CRITIC` setting has no effect.
+
+Title and credited contributors are required. Missing optional year/ISBN fields become `NA`; placeholders such as `Author(s)` are rejected. Contributor names, original titles, years, numbered editions, volumes, and ISBNs are checked against cited text where possible. ISBN-10/13 checksums and ISBN-13 prefixes are validated. Explicit format-labelled digital identifiers take precedence over print identifiers. Missing optional fields are filled deterministically only when evidence is unambiguous. Image citations remain model-derived evidence: this workflow does not independently OCR every visual claim.
+
+When multimodal mode is enabled, `pdftoppm` is required. PDF images are ranked using copyright, ISBN, edition, and contributor clues in the corresponding page text. Image-only scans use spread-out selections when text clues are unavailable. Images carry individual page IDs. `MULTIMODAL_INITIAL_IMAGES` controls the first request; identification retries can add images up to `MULTIMODAL_MAX_IMAGES`. The configured local setup starts with three and allows up to eight. Increasing the cap does not improve every book: compare accuracy and latency on a labelled set.
+
+EPUB OPF metadata and the first four spine resources are read directly. Declared cover and front-matter images are preferred without rendering a temporary PDF. If suitable native images are unavailable, EPUB, MOBI, and CHM can use temporary-PDF rendering. Rendering uses the matching PDF text to rank pages.
+
+Text evidence has independent native, front-matter, bibliographic-clue, and tail budgets, with page IDs and neighboring lines around metadata matches. These settings control its size:
+
+```bash
+EXTRACT_SENT_TO_LLM_LENGTH=12000
+LLM_HEAD_LINES=240
+LLM_METADATA_LINES=160
+LLM_TAIL_LINES=100
+LLM_CONTEXT_CHARS=18000
+```
+
+The character budget excludes prompt/schema instructions and visual tokens. `LLM_EXPECTED_CONTEXT_TOKENS` is an advisory threshold checked against reported prompt usage plus the output budget; it does **not** configure the server. For Ollama, set effective context using `PARAMETER num_ctx` in a model's Modelfile, then use that model name. `LLM_REASONING_EFFORT` is omitted when empty so the model template controls thinking; use a supported value only when the endpoint/model accepts it. `LLM_SEED` is optional and does not guarantee cross-version reproducibility. See [Ollama API compatibility](https://docs.ollama.com/api/openai-compatibility) and [structured outputs](https://docs.ollama.com/capabilities/structured-outputs).
+
+`LOG_MODEL_METADATA=true` optionally saves Ollama model details, digest, server version, and loaded context/GPU allocation when available. Unsupported metadata endpoints do not block renaming. This is enabled in the local Ollama configuration and disabled by default for generic compatible endpoints.
 
 ### Retry/timeout tuning
 
@@ -250,9 +278,15 @@ When multimodal mode is enabled, `pdftoppm` is required. PDF inputs are scanned 
 API_TIMEOUT_SECONDS=120
 API_RETRY_DELAY_SECONDS=2
 MAX_INVALID_RESPONSE_RETRIES=3
+MAX_API_TRANSPORT_RETRIES=3
+MAX_API_ATTEMPTS=6
+API_FILE_DEADLINE_SECONDS=600
+API_RETRY_MAX_DELAY_SECONDS=30
 ```
 
-The script tests API connectivity before processing the input set and writes failures to the processing log.
+Invalid-output retries receive the previous output and the specific validation failure. Identification retries expand evidence within configured limits; truncated output increases the output budget up to `LLM_MAX_OUTPUT_TOKENS`. Transport failures and transient HTTP 408/425/429/500/502/503/504 responses use bounded exponential backoff with jitter and `Retry-After`. Authentication/request failures are not retried. `MAX_API_ATTEMPTS` caps all extraction calls, while the per-file deadline bounds the API/retry phase (not document conversion). Retry delays are capped at 60 seconds or less. Preflight is a separate single request bounded by `API_TIMEOUT_SECONDS`.
+
+`RENAME_LLM_CONFIG=/path/to/config.conf` selects an alternate configuration without editing the repository's local configuration.
 
 ## Usage
 
@@ -346,18 +380,53 @@ At a high level, `rename-using-llm.sh` does the following for each supported fil
 1. identifies the current filename and extension
 2. repairs a legacy possessive-name artifact when present
 3. extracts text from the publication
-4. builds a bounded evidence packet from likely bibliographic portions of the document
-5. optionally extracts page images for multimodal evidence
-6. asks the configured model for a canonical filename stem
-7. optionally asks a critic pass to repair a weak first result
-8. performs deterministic cleanup
-9. enforces the required `Title - Author (Year) [ISBN]` structure
+4. reads native EPUB metadata/front matter and builds independently budgeted text sections
+5. optionally selects and labels bibliographic page images
+6. asks the configured model for structured metadata (or a filename in explicit legacy text mode)
+7. validates factual support and retries with targeted feedback/additional evidence when needed
+8. constructs the filename and performs deterministic cleanup
+9. enforces the required `Title - Author (Year) [ISBN]` structure and ISBN checksums
 10. preserves explicit source volume/edition information
 11. normalizes terminal `by Author` credits to the canonical ` - Author` form
 12. archives the original in `Originals/`
 13. renames the working file in place, adding a numeric suffix only for a real collision
 
 This layered approach is intentional: the final filename is not accepted solely because the model returned something plausible.
+
+### Regression checks and model comparisons
+
+Run the dependency-free regression suite with:
+
+```bash
+python3 -m unittest discover -s tests -v
+bash -n rename-using-llm.sh
+git diff --check
+```
+
+Each run writes a `.log.metrics.jsonl` sidecar with per-file outcome, final fields, missing optional fields, API calls/usage/time, validation failure details, transport failures, image count, fallback use, and total processing time including extraction/rendering/archive/conversion. Ten runs and their sidecars are retained. API timing excludes conversion; per-file timing includes it. Rename/conversion failures are recorded separately; failed CHM/MOBI conversion retains the working source and its archived copy and removes the partial PDF.
+
+For a representative comparison, label 30–50 publications spanning scanned PDFs, EPUBs, multiple ISBNs, editions, volumes, missing fields, title-internal `by`, and multiple title separators. Create a manifest of expected filename **stems** (without extensions):
+
+```json
+[
+  {
+    "file": "fixtures/learn-by-doing.pdf",
+    "expected": "Learn by Doing - Jane Smith (2024) [9780306406157]",
+    "tags": ["title_by", "pdf"]
+  }
+]
+```
+
+Paths are relative to the manifest. Compare configurations with:
+
+```bash
+python3 scripts/benchmark_llm.py labelled-books.json \
+  --config /path/to/three-images.conf \
+  --config /path/to/eight-images.conf \
+  --output /path/to/new-comparison-directory
+```
+
+The benchmark processes temporary copies through the actual Bash workflow and leaves source publications untouched. It saves per-book exact filename/field correctness, missing fields, retry rates, latency, logs, model metadata when enabled, and summaries by tag. Failed/unprocessed books count against accuracy. The run total includes preflight and metadata inspection; per-file totals start before extraction. Hold the corpus and model version/digest constant when evaluating image count, temperature, token budget, or quantization. Synthetic/mock tests establish behavior, not representative model accuracy or host throughput.
 
 ## Logging and Troubleshooting
 

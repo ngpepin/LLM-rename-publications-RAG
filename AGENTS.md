@@ -56,9 +56,9 @@ The script:
 
 1. extracts text (`pdftotext` for PDF, `ebook-convert` for other supported formats)
 2. builds a bounded evidence packet from the document
-3. optionally extracts page images for multimodal evidence; EPUB inputs use temporary-PDF rendering when possible and fall back to embedded EPUB images if that conversion fails
+3. optionally selects and labels bibliographic page images; EPUB inputs prefer native metadata/front-matter/images and use temporary-PDF rendering when suitable native images are unavailable
 4. calls the configured OpenAI-compatible chat-completions API
-5. optionally runs a critic pass
+5. validates structured metadata and factual support, retrying with targeted feedback/additional evidence when needed; there is no critic phase
 6. performs deterministic cleanup and strict filename validation
 7. preserves explicit source volume/edition evidence
 8. archives the pre-rename source in `Originals/`
@@ -118,15 +118,29 @@ Important settings include:
 - `API_ENDPOINT`
 - `MODEL`
 - `API_KEY`
-- `ENABLE_CRITIC`
+- `LLM_RESPONSE_FORMAT`
+- `LLM_TEMPERATURE`
+- `LLM_MAX_TOKENS`
+- `LLM_MAX_OUTPUT_TOKENS`
+- `LLM_SEED`
+- `LLM_REASONING_EFFORT`
+- `LLM_EXPECTED_CONTEXT_TOKENS` (advisory; actual context belongs to the server)
+- `LOG_MODEL_METADATA`
 - `ENABLE_MULTIMODAL`
 - `MULTIMODAL_MAX_IMAGES`
+- `MULTIMODAL_INITIAL_IMAGES`
 - `MULTIMODAL_SCAN_PAGES`
 - `MULTIMODAL_IMAGE_DPI`
 - `MULTIMODAL_NONWHITE_FRACTION`
 - `API_TIMEOUT_SECONDS`
 - `API_RETRY_DELAY_SECONDS`
 - `MAX_INVALID_RESPONSE_RETRIES`
+- `MAX_API_TRANSPORT_RETRIES`
+- `MAX_API_ATTEMPTS`
+- `API_FILE_DEADLINE_SECONDS`
+- `API_RETRY_MAX_DELAY_SECONDS`
+
+`RENAME_LLM_CONFIG` selects an alternate config for isolated tests/benchmarks. Per-file metrics and optional model metadata are saved alongside logs. `scripts/benchmark_llm.py` processes temporary copies of a labelled corpus; originals are not renamed by the benchmark.
 
 Do not hardcode machine-specific paths or private endpoint values into general-purpose scripts or documentation. Keep machine-specific values in configuration files.
 
