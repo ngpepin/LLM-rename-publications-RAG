@@ -1,5 +1,28 @@
 {
   "files": {
+    "AGENTS.md": {
+      "active_view_id": 1,
+      "next_tab_color_index": 1,
+      "next_view_id": 2,
+      "next_view_sequence": 2,
+      "preview": {
+        "layout": 0,
+        "zoom_factor": 1.0
+      },
+      "tabs": [
+        {
+          "color_slot": 0,
+          "sequence": 1,
+          "view_id": 1
+        }
+      ],
+      "view_states": {
+        "1": {
+          "scroll_y": 2160.0,
+          "top_line": 80
+        }
+      }
+    },
     "README-LANGCHAIN.md": {
       "active_view_id": 1,
       "next_tab_color_index": 1,

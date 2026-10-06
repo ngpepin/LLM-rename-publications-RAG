@@ -28,6 +28,7 @@ API_KEY=""      # API key sourced from rename-using-llm.conf
 # Source the configuration file
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/rename-using-llm.conf"
+CANONICAL_TITLE_TERMS_FILE="$SCRIPT_DIR/canonical-title-terms.txt"
 
 INPUT_DIR="$1" # Directory containing the book files
 LOG_FILE="$PROJ_DIR/logs/rename_books_$$"
@@ -37,11 +38,11 @@ LOG_FILE+="_${CURRENT_TIME}.log" # Log file for storing the output
 : "${MAX_INVALID_RESPONSE_RETRIES:=3}" # Invalid model responses before clear failure
 ORIGINALS_SUBDIR="Originals" # Directory to store copies of original files
 FAILED_SUBDIR="Failed"       # Directory to store renamed files
-EXTRACT_SENT_TO_LLM_LENGTH=10000 # Maximum source lines scanned for useful bibliographic evidence
-: "${LLM_HEAD_LINES:=220}"       # Beginning-of-document lines included in the evidence packet
-: "${LLM_TAIL_LINES:=80}"        # End-of-sample lines included in the evidence packet
-: "${LLM_METADATA_LINES:=120}"   # Metadata-like lines included in the evidence packet
-: "${LLM_CONTEXT_CHARS:=16000}"  # Maximum characters sent as document evidence
+EXTRACT_SENT_TO_LLM_LENGTH=12000 # Maximum source lines scanned for useful bibliographic evidence
+: "${LLM_HEAD_LINES:=240}"       # Beginning-of-document lines included in the evidence packet
+: "${LLM_TAIL_LINES:=100}"        # End-of-sample lines included in the evidence packet
+: "${LLM_METADATA_LINES:=160}"   # Metadata-like lines included in the evidence packet
+: "${LLM_CONTEXT_CHARS:=18000}"  # Maximum characters sent as document evidence
 : "${ENABLE_CRITIC:=true}"
 : "${ENABLE_MULTIMODAL:=true}"
 : "${MULTIMODAL_MAX_IMAGES:=3}"
@@ -74,6 +75,10 @@ if [[ "$INPUT_DIR" == "." ]]; then
 fi
 if [ ! -d "$INPUT_DIR" ]; then
     echo "Error: Directory '$INPUT_DIR' not found." | tee -a "$LOG_FILE"
+    exit 1
+fi
+if [[ ! -r "$CANONICAL_TITLE_TERMS_FILE" ]]; then
+    echo "Error: Required title terminology catalog '$CANONICAL_TITLE_TERMS_FILE' is missing or unreadable."
     exit 1
 fi
 # Check requirements
@@ -874,6 +879,66 @@ response_format_issue() {
     fi
 }
 
+candidate_from_structured_source_filename() {
+    # Deterministic fallback for archive/download-manager filenames that already
+    # encode bibliographic metadata as: Title -- Contributors -- ... Year ... --
+    # isbn13 NNN... -- other provenance fields. This prevents a weak model reply
+    # such as "Title.pdf" from discarding metadata that is explicitly present in
+    # the source filename.
+    local source_name="$1"
+
+    python3 - "$source_name" <<'PY'
+import re
+import sys
+
+source_name = sys.argv[1].strip()
+stem = re.sub(r"(?i)\.(?:pdf|epub|chm|mobi)$", "", source_name).strip()
+parts = [part.strip() for part in re.split(r"\s+--\s+", stem) if part.strip()]
+if len(parts) < 2:
+    raise SystemExit(1)
+
+title = parts[0].strip()
+contributors = parts[1].strip()
+if not title or not contributors:
+    raise SystemExit(1)
+
+# Normalize common filename-safe punctuation and contributor role spellings.
+contributors = re.sub(r"\b([A-Z])_\s+", r"\1. ", contributors)
+contributors = re.sub(r"(?i)\(\s*editor\s*\)", "(Editor)", contributors)
+contributors = re.sub(r"(?i)\(\s*editors\s*\)", "(Editors)", contributors)
+contributors = re.sub(r"(?i)\(\s*ed\.?\s*\)", "(Editor)", contributors)
+contributors = re.sub(r"(?i)\(\s*eds\.?\s*\)", "(Editors)", contributors)
+contributors = re.sub(r"\s+", " ", contributors).strip(" ,;-")
+
+# Use an explicit four-digit year from the structured metadata segments. The
+# first such value after contributors is preferred; hashes/provenance fields are
+# deliberately ignored unless they contain a standalone plausible publication year.
+year = "NA"
+for part in parts[2:]:
+    match = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", part)
+    if match:
+        year = match.group(1)
+        break
+
+# ISBN must be explicitly labelled in the source filename; do not treat random
+# long numeric strings or archive hashes as ISBNs.
+isbn = "NA"
+for part in parts[2:]:
+    match = re.search(
+        r"(?i)\bisbn(?:-?1[03])?\s*:?\s*([0-9Xx][0-9Xx\s-]{8,})",
+        part,
+    )
+    if not match:
+        continue
+    value = re.sub(r"[\s-]+", "", match.group(1)).upper()
+    if re.fullmatch(r"\d{13}|\d{9}[\dX]", value):
+        isbn = value
+        break
+
+print(f"{title} - {contributors} ({year}) [{isbn}]")
+PY
+}
+
 repair_candidate_from_evidence() {
     # Repair a common small-model near miss: the model identifies title/author
     # correctly but emits ISBN as a parenthetical and omits the publication year.
@@ -958,11 +1023,12 @@ enforce_title_case_candidate() {
     # deterministic fallback. Author names and trailing metadata are untouched.
     local candidate="$1"
 
-    python3 - "$candidate" <<'PY'
+    python3 - "$candidate" "$CANONICAL_TITLE_TERMS_FILE" <<'PY'
 import re
 import sys
 
 candidate = sys.argv[1].strip()
+terms_path = sys.argv[2]
 match = re.fullmatch(r"(.+)\s+-\s+(.+?)\s+\((\d{4}|NA)\)\s+\[([^\[\]]+)\]", candidate, flags=re.IGNORECASE)
 if not match:
     print(candidate)
@@ -972,33 +1038,25 @@ title, authors, year, isbn = (part.strip() for part in match.groups())
 small = {"a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into", "nor", "of", "on", "onto", "or", "per", "the", "to", "via", "vs", "with"}
 
 # Canonical spellings for acronyms, initialisms, standards, product names, and
-# casing-sensitive technical terms. Match case-insensitively because small/local
-# models often emit "Apis", "Iot", "Llms", "Mlops", etc. before this final
-# deterministic title normalization pass.
-canonical_terms = {
-    term.lower(): term
-    for term in """
-AI AGI ANI ASI ML DL NLP NLU NLG LLM RAG RL RLHF DPO PPO SFT LoRA QLoRA GAN CNN RNN LSTM GRU VAE OCR ASR TTS
-API SDK CLI GUI IDE REPL ABI FFI RPC REST RESTful gRPC GraphQL JSON JSONL XML YAML TOML CSV TSV HTML XHTML CSS DOM HTTP HTTPS URL URI URN UUID GUID MIME JWT OAuth OIDC SAML LDAP CORS CSRF XSS SSRF SQL NoSQL ACID CRUD ORM JDBC ODBC DBMS RDBMS ETL ELT OLTP OLAP BI BSON Protobuf Avro Parquet ORC
-OpenAPI OpenAI ChatGPT GPT Anthropic Claude Gemini Copilot
-AWS GCP SaaS PaaS IaaS FaaS IAM VPC VPN CDN DNS DNSSEC DHCP TCP UDP IP TLS SSL SSH SFTP FTP FTPS SMTP IMAP POP3 SNMP NTP ICMP BGP OSPF NAT CIDR VLAN WLAN LAN WAN SDN NFV QoS MQTT AMQP QUIC WebSocket WebRTC WebDAV SIP RTP RTSP SMB CIFS NFS iSCSI
-SIEM SOAR SOC MFA SSO RBAC ABAC ACL PKI AES DES RSA ECC ECDSA SHA HMAC KMS TPM HSM CVE CVSS CWE CTF OWASP MITRE YARA IOC DLP EDR XDR MDR IDS IPS WAF CASB CSPM CNAPP SAST DAST IAST SBOM SCA PAM UEBA NDR UTM IOC TTP ATT&CK STIX TAXII
-IoT IIoT MLOps AIOps DevOps DevSecOps FinOps GitOps DataOps SecOps NoOps
-CPU GPU TPU NPU RAM ROM SSD HDD NVMe PCIe USB HDMI FPGA ASIC SoC SIMD MIMD NUMA BIOS UEFI ACPI SATA CUDA ROCm ARM ARM64 AMD64 RISC RISC-V POSIX GNU BSD WSL RHEL RPM DEB APT PCI ISA DMA IOMMU MMU ECC DIMM SRAM DRAM VRAM
-macOS iOS iPadOS watchOS tvOS visionOS JavaScript TypeScript PowerShell WebAssembly OpenSSL OpenSSH OpenGL OpenCL OpenCV eBPF iPhone iPad eBook ePub LaTeX BibTeX TeX
-Git GitHub GitLab Bitbucket CI CD JVM JDK JRE WASM PHP VBA JSX TSX npm Yarn pnpm Maven Gradle NuGet pip Conda
-MySQL PostgreSQL SQLite MongoDB MariaDB CouchDB DynamoDB HBase NiFi Redis Cassandra Neo4j InfluxDB Elasticsearch OpenSearch ClickHouse Snowflake BigQuery Redshift
-Docker Kubernetes OpenShift Terraform Ansible Helm Jenkins ArgoCD Podman containerd BuildKit Dockerfile Compose Istio Envoy Prometheus Grafana
-PyPI PyTorch TensorFlow Keras JAX CUDA NumPy SciPy pandas Matplotlib scikit-learn XGBoost LightGBM HuggingFace ONNX MLflow
-SRE SLA SLO SLI APM OpenTelemetry OTLP Jaeger Zipkin RUM RTO RPO MTTR MTBF
-ISO IEC IEEE ANSI RFC W3C ECMA ASCII UTF Unicode POSIX IETF WHATWG WCAG
-PDF EPUB MOBI AZW AZW3 JPEG JPG PNG GIF SVG TIFF WebP AVIF HEIF HEIC MP3 MP4 AAC FLAC WAV OGG MKV MOV AVI MPEG HLS DASH
-AR VR XR GIS GPS GNSS RFID NFC QR CAD CAM CAE CNC PLC SCADA HVAC BIM LiDAR RADAR HMI DCS RTU OPC UA
-DNA RNA mRNA tRNA rRNA PCR qPCR RT-PCR CRISPR MRI fMRI EEG ECG EKG EMG STEM CT PET SNP SNPs NGS FASTA FASTQ BAM SAM VCF
-CEO CFO CTO CIO CISO COO CDO CPO CSO KPI OKR ROI ROAS CRM ERP SCM HCM B2B B2C D2C SMB SME TAM SAM SOM ARR MRR CAGR EBITDA
-GDPR HIPAA PCI DSS NIST SOX FERPA CCPA CPRA FIPS FedRAMP SOC 2 ISO 27001
-""".split()
-}
+# other casing-sensitive technical terms are maintained in one external catalog.
+# Matching is case-insensitive because small/local models commonly emit forms like
+# "Apis", "Iot", "Llms", and "Mlops". For duplicate case-insensitive keys the
+# first catalog entry wins, making conflict handling deterministic and stable.
+canonical_terms = {}
+try:
+    with open(terms_path, encoding="utf-8") as terms_file:
+        for raw_line in terms_file:
+            term = raw_line.strip()
+            if not term or term.startswith("#"):
+                continue
+            canonical_terms.setdefault(term.casefold(), term)
+except OSError as exc:
+    print(f"Error: unable to read required title terminology catalog '{terms_path}': {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+if not canonical_terms:
+    print(f"Error: required title terminology catalog '{terms_path}' contains no usable terms.", file=sys.stderr)
+    raise SystemExit(2)
 
 word_re = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
 words = list(word_re.finditer(title))
@@ -1013,9 +1071,27 @@ def canonical_term(word):
     if possessive_match:
         base, possessive = possessive_match.groups()
 
-    low = base.lower()
+    low = base.casefold()
     if low in canonical_terms:
-        return canonical_terms[low] + possessive
+        canonical = canonical_terms[low]
+        # Do not force ordinary all-lowercase dictionary words to remain lowercase
+        # under Title Case. Lowercase spellings are honored only for a small set of
+        # known casing-sensitive technology names.
+        lowercase_brand_terms = {"npm", "pip", "pandas", "containerd", "systemd", "rustc", "rustup", "asyncio", "dbt", "pgvector", "glibc", "musl", "libc", "pytest"}
+        # Some valid acronyms are also ordinary English words. Do not turn normal
+        # title prose such as "Health Care", "First Steps", "Fast Search", or
+        # "Can We" into "Health CARE", "FIRST Steps", "FAST Search", or
+        # "CAN We" merely because the catalog contains the acronym. Preserve the
+        # acronym only when the model/source already supplied it in all caps.
+        ambiguous_common_acronyms = {
+            "act", "arc", "care", "can", "edge", "fast", "first", "glue",
+            "ice", "map", "matter", "mode", "most", "pan", "ram", "sam",
+            "search", "star", "swift", "thread", "turn", "var",
+        }
+        if canonical.isupper() and low in ambiguous_common_acronyms and not base.isupper():
+            return None
+        if not (canonical.islower() and canonical not in lowercase_brand_terms):
+            return canonical + possessive
 
     # Pluralize an all-uppercase canonical initialism predictably: APIs, SDKs,
     # LLMs, GPUs, CVEs, etc., even when the model returned Apis/Sdks/Llms/Gpus.
@@ -1043,31 +1119,18 @@ def title_word(match):
 
 title = word_re.sub(title_word, title)
 
-# A few stylized terms contain punctuation/digits that the word tokenizer treats
-# as separate tokens. Normalize those after the main pass.
-post_canonical = (
-    (r"(?i)\bNode\.Js\b", "Node.js"),
-    (r"(?i)\bNext\.Js\b", "Next.js"),
-    (r"(?i)\bVue\.Js\b", "Vue.js"),
-    (r"(?i)\bASP\.Net\b", "ASP.NET"),
-    (r"(?i)(?<![A-Za-z0-9_])\.Net\b", ".NET"),
-    (r"(?i)\bK8S\b", "K8s"),
-    (r"(?i)\bIPV4\b", "IPv4"),
-    (r"(?i)\bIPV6\b", "IPv6"),
-    (r"(?i)\bHTTP/2\b", "HTTP/2"),
-    (r"(?i)\bHTTP/3\b", "HTTP/3"),
-    (r"(?i)\bCI/CD\b", "CI/CD"),
-    (r"(?i)\bTCP/IP\b", "TCP/IP"),
-    (r"(?i)\bWI-FI\b", "Wi-Fi"),
-    (r"(?i)\bX86_64\b", "x86_64"),
-    (r"(?i)\bX86\b", "x86"),
-    (r"(?i)\bX64\b", "x64"),
-    (r"(?i)\bNeo4J\b", "Neo4j"),
-    (r"(?i)\bSCIKIT-LEARN\b", "scikit-learn"),
-    (r"(?i)\bHUGGINGFACE\b", "HuggingFace"),
-)
-for pattern, replacement in post_canonical:
-    title = re.sub(pattern, replacement, title)
+# Terms containing punctuation, digits, whitespace, or other non-word syntax are
+# repaired after ordinary word title-casing. Longer entries are matched first so
+# specific spellings such as HTTP/3 or ASP.NET win before shorter fragments.
+complex_terms = []
+for canonical in canonical_terms.values():
+    if re.fullmatch(r"[A-Za-z]+(?:['’][A-Za-z]+)?", canonical):
+        continue
+    complex_terms.append(canonical)
+
+for canonical in sorted(complex_terms, key=len, reverse=True):
+    pattern = rf"(?<![A-Za-z0-9_]){re.escape(canonical)}(?![A-Za-z0-9_])"
+    title = re.sub(pattern, lambda _m, value=canonical: value, title, flags=re.IGNORECASE)
 print(f"{title} - {authors} ({year.upper()}) [{isbn}]")
 PY
 }
@@ -1572,6 +1635,25 @@ PY
                     new_name="$source_fallback"
                     to_skip=false
                     break
+                fi
+
+                # Some archive/download filenames are not already in final
+                # bibliographic format but still contain explicit structured metadata,
+                # for example:
+                #   Title -- Author (editor) -- 1, 2021 -- Publisher -- isbn13 978...
+                # Recover those fields deterministically before spending another model
+                # retry. Only labelled/explicit source metadata is used; nothing is
+                # guessed from the incomplete model reply.
+                structured_source_fallback=""
+                if structured_source_fallback=$(candidate_from_structured_source_filename "$filename" 2>/dev/null); then
+                    structured_source_fallback=$(ensure_source_volume "$structured_source_fallback" "$filename")
+                    structured_source_fallback=$(ensure_edition "$structured_source_fallback" "$filename" "$extracted_text")
+                    if structured_source_fallback=$(deterministic_candidate_cleanup "$structured_source_fallback" 2>/dev/null) && strict_response_format "$structured_source_fallback"; then
+                        echo "Using structured source-filename fallback after invalid model output: $structured_source_fallback" | tee -a "$LOG_FILE"
+                        new_name="$structured_source_fallback"
+                        to_skip=false
+                        break
+                    fi
                 fi
 
                 ((invalid_response_retries++))
