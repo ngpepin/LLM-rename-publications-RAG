@@ -55,12 +55,96 @@ class MetadataTests(unittest.TestCase):
         for isbn in ("9780306406158", "1234567890128", "0804429571", "9788132262000"):
             self.assertFalse(metadata.isbn_valid(isbn), isbn)
 
+    def test_pdf_isbn_formatting_and_per_identifier_labels(self):
+        text = "ISBN: 978-\u200b1-\u200b032-\u200b96063-\u200b0 (hbk)\nISBN: 978-\u200b1-\u200b003-\u200b58778-\u200b1 (ebk)"
+        self.assertEqual(metadata.isbn_candidates(text, "pdf")[0], (60, "9781003587781"))
+        text = "ISBN 978-3-658-51115-9 ISBN 978-3-658-51116-6 (eBook)"
+        self.assertEqual(metadata.isbn_candidates(text, "pdf"), [(60, "9783658511166"), (10, "9783658511159")])
+        self.assertEqual(metadata.isbn_normalize("978-1-945188-55-8 (paperback)"), "9781945188558")
+
+    def test_multiline_copyright_and_original_translation_year(self):
+        text = ('Translation from the German language edition: original title\n'
+                'Gerhard Speckbacher, © The editor(s) or author(s), exclusively licensed\n'
+                'Wiesbaden GmbH. 2025. Published by Springer Gabler.\n'
+                '© The Editor(s) and The Author(s), under exclusive license\n'
+                'Wiesbaden GmbH, part of Springer Nature 2026\n')
+        packet = metadata.evidence_packet(text)
+        self.assertEqual(metadata.publication_years(metadata.identity_evidence(packet)), {"2026"})
+        self.assertEqual(metadata.publication_years("First published 2027\nA global fellow at AI2030, Parth is a published author"), {"2027"})
+
+    def test_copyright_and_editor_title_pages_survive_long_blurbs(self):
+        text = ("Long introductory blurb " * 500 + "\f" + "More opening prose " * 100 +
+                "\fThe Actual Title\nEdited by\nJane Smith\fFirst published 2027\nISBN: 9781003724889 (ebk)")
+        packet = metadata.evidence_packet(text, max_chars=6000)
+        opening = packet.split("=== FRONT MATTER ===")[1].split("=== BIBLIOGRAPHIC CLUES ===")[0]
+        self.assertIn("The Actual Title", opening)
+        self.assertIn("First published 2027", opening)
+
+    def test_catalog_title_does_not_include_author_responsibility(self):
+        packet = EVIDENCE + "\nTitle: Learn by Doing / Jane Smith."
+        candidate = metadata.parse_metadata(record(original_title="Learn by Doing / Jane Smith."), packet, "source.pdf", [])
+        self.assertTrue(candidate.startswith("Learn by Doing -"))
+
+    def test_readable_image_text_discards_fabricated_edition(self):
+        data = record(edition="First Edition")
+        data["sources"]["edition"] = ["IMAGE_P1"]
+        candidate = metadata.parse_metadata(data, EVIDENCE + "\n" + "Readable copyright page " * 10, "source.pdf", ["page-1.jpg"])
+        self.assertNotIn("First Edition", candidate)
+        self.assertIn("Jane Smith (2024)", candidate)
+
     def test_placeholder_authors_and_bad_isbn_rejected(self):
-        for author in ("Author(s)", "(Author)", "Unknown", "NA"):
+        for author in ("Author(s)", "(Author)", "Unknown"):
             with self.assertRaises(ValueError):
                 metadata.validate_filename(f"Example - {author} (2024) [NA]")
         with self.assertRaises(ValueError):
             metadata.validate_filename("Example - Jane Smith (2024) [9780306406158]")
+        self.assertEqual(metadata.validate_filename("Example - NA (NA) [NA]")[1:], ("NA", "NA", "NA"))
+        metadata.validate_filename("NA - NA (NA) [NA]")
+
+    def test_missing_contributors_are_accepted_without_retry(self):
+        for authors in ([], ["Author(s)"], ["(Author)"], ["Unknown"], ["NA"]):
+            candidate = metadata.parse_metadata(record(authors=authors), EVIDENCE, "source.pdf", [])
+            self.assertEqual(candidate, "Learn by Doing - NA (2024) [9780306406157]")
+            metadata.validate_evidence(candidate, EVIDENCE, "source.pdf", [])
+
+    def test_missing_fields_recovered_from_filename(self):
+        source = "Learn by Doing - A Practical Guide - Jane Smith (2024) [9780306406157].pdf"
+        data = record(status="unidentified", title=None, authors=[], year=None, isbn=None,
+                      sources={field: [] for field in metadata.FIELDS})
+        candidate = metadata.parse_metadata(data, "", source, [])
+        self.assertEqual(candidate, source[:-4])
+        metadata.validate_evidence(candidate, "", source, [])
+
+    def test_reported_legacy_author_placeholder(self):
+        source = "Healing Joints and Nerves - (Author) (NA) [NA].pdf"
+        data = record(status="unidentified", title=None, authors=[], year=None, isbn=None,
+                      sources={field: [] for field in metadata.FIELDS})
+        self.assertEqual(metadata.parse_metadata(data, "", source, []),
+                         "Healing Joints and Nerves - NA (NA) [NA]")
+
+    def test_document_fields_win_and_missing_fields_use_filename(self):
+        source = "Old Title - Existing Author (2020) [080442957X].pdf"
+        candidate = metadata.parse_metadata(record(authors=[], year=None, isbn=None), EVIDENCE, source, [])
+        self.assertEqual(candidate, "Learn by Doing - Existing Author (2024) [9780306406157]")
+        self.assertEqual(metadata.parse_metadata(record(), EVIDENCE, source, []),
+                         "Learn by Doing - Jane Smith (2024) [9780306406157]")
+
+    def test_plain_filename_separators_are_part_of_title(self):
+        self.assertEqual(metadata.source_candidate("Learn by Doing - A Practical Guide.pdf"),
+                         "Learn by Doing - A Practical Guide - NA (NA) [NA]")
+        self.assertEqual(metadata.source_candidate("Example - Jane Smith (2024).pdf"),
+                         "Example - Jane Smith (2024) [NA]")
+        self.assertEqual(metadata.source_candidate("Example -- Jane Smith -- 2024 -- isbn13 9780306406157.pdf"),
+                         "Example - Jane Smith (2024) [9780306406157]")
+
+    def test_editor_recovery_and_ambiguous_document_fields(self):
+        source = "Example - Jane Smith, John Doe (Editors) (2020) [080442957X].pdf"
+        self.assertEqual(metadata.source_candidate(source, "Copyright 2022, 2024"),
+                         "Example - Jane Smith, John Doe (Editors) (NA) [080442957X]")
+
+    def test_supported_original_wording_replaces_rewritten_title(self):
+        candidate = metadata.parse_metadata(record(title="Learning Through Practice", original_title="Learn by Doing"), EVIDENCE, "source.pdf", [])
+        self.assertTrue(candidate.startswith("Learn by Doing -"))
 
     def test_partial_repair_consumes_existing_year(self):
         evidence = "Copyright 2025\nISBN: 9780306406157"
@@ -88,13 +172,35 @@ class MetadataTests(unittest.TestCase):
             metadata.parse_metadata(bad, EVIDENCE, "source.pdf", [])
 
     def test_fabricated_contributors_years_and_editions_rejected(self):
-        for changes in ({"authors": ["John Doe"]}, {"year": "2019"}, {"isbn": "9780306406158"}, {"title": "A Fabricated Title"}):
+        for changes in ({"authors": ["John Doe"]}, {"title": "A Fabricated Title"}):
             with self.assertRaises(ValueError):
                 metadata.parse_metadata(record(**changes), EVIDENCE, "source.pdf", [])
         data = record(edition="Second Edition")
         data["sources"]["edition"] = ["TEXT_P1"]
-        with self.assertRaises(ValueError):
-            metadata.parse_metadata(data, EVIDENCE + "\nThird Edition", "source.pdf", [])
+        candidate = metadata.parse_metadata(data, EVIDENCE + "\nThird Edition", "source.pdf", [])
+        self.assertNotIn("Second Edition", candidate)
+
+    def test_invalid_model_isbn_uses_observed_number_or_na(self):
+        self.assertIn("(2024)", metadata.parse_metadata(record(year="2019"), EVIDENCE, "source.pdf", []))
+        self.assertTrue(metadata.parse_metadata(record(isbn="9780306406158"), EVIDENCE, "source.pdf", []).endswith("[9780306406157]"))
+        packet = EVIDENCE.replace("ISBN: 9780306406157", "")
+        self.assertTrue(metadata.parse_metadata(record(isbn="9780306406158"), packet, "source.pdf", []).endswith("[NA]"))
+        packet = "[TEXT_P1]\nLearn by Doing\nJane Smith"
+        candidate = metadata.parse_metadata(record(year="2026", isbn=None), packet, "source.pdf", [])
+        self.assertTrue(candidate.endswith("(NA) [NA]"))
+
+    def test_source_filename_credit_never_becomes_publication_title(self):
+        source = "Learn by Doing - (Author(s)) (NA) [NA].pdf"
+        data = record(original_title=source)
+        data["sources"]["title"] = ["SOURCE_FILENAME"]
+        candidate = metadata.parse_metadata(data, EVIDENCE, source, [])
+        self.assertEqual(candidate, "Learn by Doing - Jane Smith (2024) [9780306406157]")
+
+    def test_original_language_edition_is_not_translation_edition(self):
+        packet = EVIDENCE + '\nTranslation from the German language edition: "Original, 2 Ed."\n© The Author(s) 2024'
+        data = record(edition="2 Ed.")
+        data["sources"]["edition"] = ["TEXT_P1"]
+        self.assertNotIn("2 Ed", metadata.parse_metadata(data, packet, "source.pdf", []))
 
     def test_format_specific_isbn_beats_print_identifier(self):
         packet = EVIDENCE + "\nISBN (EPUB): 9780132350884"
@@ -114,10 +220,11 @@ class MetadataTests(unittest.TestCase):
         candidate = metadata.parse_metadata(data, EVIDENCE + "\nVolume 1\nFirst Edition", "source.pdf", [])
         self.assertIn(", Volume 1, First Edition -", candidate)
 
-    def test_embedded_invented_volume_cannot_bypass_validation(self):
+    def test_embedded_invented_volume_is_removed(self):
         data = record(title="Learn by Doing, Volume 99", original_title="Learn by Doing")
-        with self.assertRaisesRegex(ValueError, "volume"):
-            metadata.parse_metadata(data, EVIDENCE, "source.pdf", [])
+        candidate = metadata.parse_metadata(data, EVIDENCE, "source.pdf", [])
+        self.assertNotIn("Volume 99", candidate)
+        self.assertIn("Jane Smith (2024)", candidate)
 
     def test_original_title_recovery_requires_literal_text_support(self):
         candidate = metadata.parse_metadata(record(original_title=None), EVIDENCE, "source.pdf", [])
@@ -206,6 +313,27 @@ class BashNormalizationTests(unittest.TestCase):
         self.assertEqual(self.run_functions(["strict_response_format"], 'strict_response_format "$1"', valid).returncode, 0)
         out = self.run_functions(["ensure_source_volume"], 'ensure_source_volume "$1" "$2"', valid, "Learn by Doing Volume 2.pdf")
         self.assertIn("A Practical Guide, Volume 2 - Jane Smith", out.stdout)
+
+    def test_subtitle_title_case_and_na_author(self):
+        candidate = "Deep Learning : a Visual Approach - NA (NA) [NA]"
+        out = self.run_functions(["enforce_title_case_candidate"], 'enforce_title_case_candidate "$1"', candidate)
+        self.assertEqual(out.stdout.strip(), "Deep Learning: A Visual Approach - NA (NA) [NA]")
+
+    def test_generated_filename_is_limited_to_200_characters(self):
+        title = "A Comprehensive and Extremely Detailed Guide to " + ("Distributed Systems Engineering " * 8)
+        filename = f"{title} - Jane Smith and John Example (2024) [9780306406157].pdf"
+        out = self.run_functions(["limit_generated_filename"], 'limit_generated_filename "$1" 200', filename)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        limited = out.stdout.strip()
+        self.assertLessEqual(len(limited), 200)
+        self.assertTrue(limited.endswith(" - Jane Smith and John Example (2024) [9780306406157].pdf"))
+
+        collision = filename[:-4] + "_123.pdf"
+        out = self.run_functions(["limit_generated_filename"], 'limit_generated_filename "$1" 200', collision)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        limited_collision = out.stdout.strip()
+        self.assertLessEqual(len(limited_collision), 200)
+        self.assertTrue(limited_collision.endswith(" (2024) [9780306406157]_123.pdf"))
 
     def test_edition_not_duplicated_or_overridden_by_body(self):
         candidate = "A Book - A Guide, First Edition - Jane Smith (2024) [NA]"

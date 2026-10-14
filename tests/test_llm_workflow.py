@@ -157,14 +157,38 @@ else:
         self.assertTrue((self.books / (CANONICAL + ".pdf")).exists())
         self.assertTrue((self.books / (CANONICAL + "_1.pdf")).exists())
 
-    def test_placeholder_retry_has_targeted_feedback(self):
+    def test_placeholder_author_renames_without_retry(self):
         (self.books / "original.pdf").write_text(TEXT)
         self.actions = ["placeholder", "valid"]
         self.run_workflow()
-        self.assertEqual(len(self.requests), 2)
-        self.assertIn("placeholder", self.requests[1]["messages"][-1]["content"])
-        self.assertEqual(self.metrics[0]["invalid_responses"], 1)
-        self.assertTrue((self.books / (CANONICAL + ".pdf")).exists())
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.metrics[0]["invalid_responses"], 0)
+        self.assertTrue((self.books / "Learn by Doing - NA (2024) [9780306406157].pdf").exists())
+
+    def test_unidentified_book_uses_partial_filename_and_placeholders(self):
+        source = "Healing Joints and Nerves - (Author) (NA) [NA].pdf"
+        (self.books / source).write_text("Healing Joints and Nerves\nNo publication credits")
+        self.actions = ["unidentified"]
+        self.run_workflow()
+        self.assertEqual(len(self.requests), 1)
+        self.assertTrue((self.books / "Healing Joints and Nerves - NA (NA) [NA].pdf").exists())
+        self.assertTrue((self.books / "Originals" / source).exists())
+        self.assertEqual(self.metrics[0]["outcome"], "success")
+
+    def test_blank_text_uses_filename_without_metadata_api_call(self):
+        source = "Learn by Doing - Jane Smith (2024) [NA].pdf"
+        (self.books / source).write_text("")
+        self.run_workflow()
+        self.assertEqual(len(self.requests), 0)
+        self.assertTrue((self.books / source).exists())
+        self.assertFalse((self.books / "Learn by Doing - Jane Smith (2024) [NA]_1.pdf").exists())
+        self.assertTrue((self.books / "Originals" / source).exists())
+
+    def test_blank_text_plain_filename_uses_na_metadata(self):
+        (self.books / "Learn by Doing.pdf").write_text("")
+        self.run_workflow()
+        self.assertTrue((self.books / "Learn by Doing - NA (NA) [NA].pdf").exists())
+        self.assertEqual(self.metrics[0]["missing_metadata_fields"], 3)
 
     def test_truncated_output_retry_increases_budget(self):
         (self.books / "original.pdf").write_text(TEXT)
@@ -191,7 +215,7 @@ else:
     def test_total_attempt_cap_covers_transport_and_invalid_output(self):
         self.settings.update(MAX_API_ATTEMPTS="2", MAX_API_TRANSPORT_RETRIES="5")
         (self.books / "original.pdf").write_text(TEXT)
-        self.actions = ["placeholder", 503, "valid"]
+        self.actions = ["foreign_author", 503, "valid"]
         self.run_workflow()
         self.assertEqual(len(self.requests), 2)
         self.assertEqual(self.metrics[0]["outcome"], "failed")
@@ -205,13 +229,13 @@ else:
         self.assertEqual(self.metrics[0]["outcome"], "failed")
         self.assertEqual(self.metrics[0]["transport_failures"], 1)
 
-    def test_invalid_metadata_never_renamed(self):
+    def test_invalid_model_isbn_corrected_from_document(self):
         (self.books / "original.pdf").write_text(TEXT)
         self.actions = ["bad_isbn"] * 3
         self.run_workflow()
-        self.assertEqual(len(self.requests), 3)
-        self.assertTrue((self.books / "Failed/original.pdf").exists())
-        self.assertFalse((self.books / (CANONICAL + ".pdf")).exists())
+        self.assertEqual(len(self.requests), 1)
+        self.assertFalse((self.books / "Failed/original.pdf").exists())
+        self.assertTrue((self.books / (CANONICAL + ".pdf")).exists())
 
     def test_source_fallback_preserves_existing_canonical_name(self):
         (self.books / (CANONICAL + ".pdf")).write_text(TEXT)
@@ -223,12 +247,21 @@ else:
 
     def test_images_ranked_labelled_and_expanded_on_retry(self):
         self.settings.update(ENABLE_MULTIMODAL="true", MULTIMODAL_INITIAL_IMAGES="2", MULTIMODAL_MAX_IMAGES="4", MULTIMODAL_SCAN_PAGES="6")
+        self.settings["MULTIMODAL_TEXT_FIRST"] = "false"
         (self.books / "original.pdf").write_text(TEXT + "\fBody\fContents\fBody\fCopyright 2024 ISBN: 9780306406157\fBody")
-        self.actions = ["unidentified", "valid"]
+        self.actions = ["foreign_author", "valid"]
         self.run_workflow()
         counts = [sum(c["type"] == "image_url" for c in r["messages"][-1]["content"]) for r in self.requests]
         self.assertEqual(counts, [2, 4])
         self.assertIn("IMAGE_P5", json.dumps(self.requests[0]))
+
+    def test_readable_front_matter_prefers_text(self):
+        self.settings.update(ENABLE_MULTIMODAL="true", MULTIMODAL_TEXT_FIRST="true")
+        (self.books / "original.pdf").write_text(TEXT + "Readable front matter\n" * 40)
+        self.run_workflow()
+        self.assertIsInstance(self.requests[0]["messages"][-1]["content"], str)
+        self.assertEqual(self.metrics[0]["image_count"], 0)
+        self.assertTrue((self.books / (CANONICAL + ".pdf")).exists())
 
     def test_legacy_text_endpoint(self):
         self.settings["LLM_RESPONSE_FORMAT"] = "text"

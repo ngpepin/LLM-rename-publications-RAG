@@ -56,7 +56,9 @@ def folded(value):
 
 
 def isbn_normalize(value):
-    return re.sub(r"[\s-]", "", re.sub(r"(?i)^ISBN(?:-?1[03])?\s*:?\s*", "", value or "")).upper()
+    value = "".join("-" if unicodedata.category(c) == "Pd" else c for c in value or "" if unicodedata.category(c) != "Cf")
+    value = re.sub(r"(?i)\s*\((?:e-?book|ebk|pdf|epub|print|paperback|hardback|pbk|hbk|electronic)\)\s*$", "", value)
+    return re.sub(r"[\s-]", "", re.sub(r"(?i)^ISBN(?:-?1[03])?\s*:?\s*", "", value)).upper()
 
 
 def isbn_valid(value):
@@ -99,13 +101,48 @@ def validate_filename(value):
     if "\n" in value or "\r" in value or "/" in value or not re.fullmatch(NAME_PATTERN, value):
         raise ValueError("candidate must be one canonical filename line")
     title, authors, year, isbn = filename_parts(value)
-    if PLACEHOLDER.fullmatch(title) or any(PLACEHOLDER.fullmatch(n.strip()) for n in re.split(r"\s*;\s*|\s*,\s*", authors)):
+    if (title != "NA" and PLACEHOLDER.fullmatch(title)) or (authors != "NA" and any(PLACEHOLDER.fullmatch(n.strip()) for n in re.split(r"\s*;\s*|\s*,\s*", authors))):
         raise ValueError("placeholder title or contributor is not bibliographic metadata")
     if re.search(r"(?i)\bby\s", authors) or re.search(r"\(\d{4}\)", authors):
         raise ValueError("author field contains a residual credit or publication year")
     if isbn != "NA" and not isbn_valid(isbn):
         raise ValueError("ISBN checksum or prefix is invalid")
     return title, authors, year, isbn
+
+
+def source_metadata(source_name):
+    """Read established bibliographic fields; leave an ordinary filename as a title."""
+    stem = re.sub(r"(?i)\.(?:pdf|epub|mobi|chm|azw3)$", "", Path(source_name).name)
+    stem = re.sub(r"(?<=\])(?:_\d+|\s+\(\d+\))$", "", stem).strip()
+    title, authors, year, isbn = stem, "NA", None, None
+    if re.search(r"\((?:\d{4}|NA)\)(?:\s*\[[^\[\]]+\])?$|\[[^\[\]]+\]$", stem, re.I):
+        try:
+            title, authors, year, isbn = filename_parts(stem, partial=True)
+        except ValueError:
+            pass
+    elif " -- " in stem:
+        parts = [p.strip() for p in stem.split(" -- ")]
+        if len(parts) >= 3:
+            title, authors = parts[:2]
+            match = re.search(r"\b(?:1[5-9]|20)\d{2}\b", " -- ".join(parts[2:]))
+            year = match[0] if match else None
+            match = re.search(r"(?i)\bisbn(?:-?1[03])?\s*[:=]?\s*([\dX -]+)", " -- ".join(parts[2:]))
+            isbn = isbn_normalize(match[1]) if match else None
+    role = "editor" if re.search(r"(?i)\((?:editors?|eds?\.?)\)\s*$", authors) else "author"
+    authors = re.sub(r"(?i)\s*\((?:editors?|eds?\.?)\)\s*$", "", authors)
+    names = [n.strip() for n in re.split(r",\s*|;\s*", authors) if n.strip() and not PLACEHOLDER.fullmatch(n.strip())]
+    return dict(title=title if title and not PLACEHOLDER.fullmatch(title) else "NA", authors=names,
+                contributor_role=role, year=year if year and year != "NA" else None,
+                isbn=isbn if isbn and isbn_valid(isbn) else None)
+
+
+def source_candidate(source_name, evidence="", extension=""):
+    data = source_metadata(source_name)
+    authors = ", ".join(data["authors"]) or "NA"
+    if data["authors"] and data["contributor_role"] == "editor":
+        authors += " (Editor)" if len(data["authors"]) == 1 else " (Editors)"
+    # Treat filename year/ISBN as hints; unambiguous document metadata wins.
+    return repair_candidate(f"{data['title']} - {authors} (NA) [NA]", evidence, extension, source_name)
 
 
 def clean_pages(text, max_lines=12000):
@@ -117,7 +154,7 @@ def clean_pages(text, max_lines=12000):
             break
         raw_lines = page.splitlines()[:remaining]
         remaining -= len(raw_lines)
-        page = unicodedata.normalize("NFKC", "\n".join(raw_lines)).replace("\u00ad", "")
+        page = "".join(c for c in unicodedata.normalize("NFKC", "\n".join(raw_lines)) if unicodedata.category(c) != "Cf")
         page = re.sub(r"(?<=\w)-[ \t]*\n[ \t]*(?=[a-z])", "", page)
         lines = []
         for line in page.splitlines():
@@ -157,7 +194,17 @@ def evidence_packet(text, native="", max_lines=12000, head_lines=240, tail_lines
     pages = clean_pages(text, max_lines)
     head, tail, clues = [], [], []
     remaining = head_lines
-    for sid, lines in pages:
+    # Complete identity pages take precedence over long blurbs, biographies and
+    # contents, which can otherwise consume the opening-text budget first.
+    def identity_priority(page):
+        sid, lines = page
+        content = "\n".join(lines)
+        if re.search(r"(?i)\bisbn\b|©|\bcopyright\b", content):
+            return 100
+        if re.search(r"(?i)\bedited by\b|\bwritten by\b", content):
+            return 80
+        return 50 if len(content) < 600 else 0
+    for sid, lines in sorted(pages, key=lambda page: (-identity_priority(page), int(page[0][6:]))):
         if remaining <= 0:
             break
         if int(sid.removeprefix("TEXT_P")) <= front_pages:
@@ -169,7 +216,12 @@ def evidence_packet(text, native="", max_lines=12000, head_lines=240, tail_lines
             break
         tail.insert(0, (sid, lines[-remaining:]))
         remaining -= len(lines[-remaining:])
+    opening_has_metadata = any(int(p[0][6:]) <= front_pages and identity_priority(p) == 100 for p in pages)
     for sid, lines in pages:
+        # Once opening pages contain publication data, distant citations and
+        # chapter bibliographies add ambiguity rather than publication evidence.
+        if int(sid[6:]) > front_pages and opening_has_metadata:
+            continue
         indexes = [i for i, line in enumerate(lines) if CLUES.search(line)]
         # Preserve local context and prioritize copyright/edition/ISBN over generic references.
         for i in indexes:
@@ -284,14 +336,14 @@ def metadata_schema(ids):
              "title": {**nullable, "description": "Publication title; preserve English/French/Spanish wording, translate other languages to English."},
              "original_title": {**nullable, "description": "Verbatim title from the evidence, including when identical to title; null only if unidentified."},
              "title_language": {"type": "string", "enum": ["en", "fr", "es", "other"]},
-             "authors": {"type": "array", "items": {"type": "string"}},
+             "authors": {"type": "array", "items": {"type": "string"}, "description": "Credited authors or primary editors; empty array if unavailable. Missing contributors never prevent identification."},
              "contributor_role": {"type": "string", "enum": ["author", "editor"]},
              "edition": {**nullable, "description": "Complete edition designation, e.g. First Edition; null if absent."},
              "volume": {**nullable, "description": "Complete volume designation, e.g. Volume 1; null if absent."},
              "year": {**nullable, "description": "Four-digit publication year for the identified edition."},
              "isbn": {**nullable, "description": "ISBN digits (final X allowed for ISBN-10), or null if absent."},
              "sources": {"type": "object", "additionalProperties": False,
-                         "properties": {field: {"type": "array", "items": {"type": "string", "enum": ids}} for field in FIELDS},
+                         "properties": {field: {"type": "array", "maxItems": 2, "items": {"type": "string", "enum": ids}} for field in FIELDS},
                          "required": list(FIELDS)}}
     return {"type": "object", "additionalProperties": False, "properties": props, "required": list(props)}
 
@@ -300,9 +352,9 @@ def payload(model, system, prompt, packet, images, mode="json_schema", temperatu
     ids = sorted(set(sources_in(packet)) | {image_id(p) for p in images} | {"SOURCE_FILENAME"})
     schema = metadata_schema(ids)
     if mode != "text":
-        prompt += "\nReturn JSON matching this schema. Null means missing; unidentified means title or contributors cannot be identified.\n" + json.dumps(schema)
+        prompt += "\nReturn JSON matching this schema. Cite only one or two decisive source IDs per field; never enumerate all supplied pages. Use null for missing scalar fields and [] for missing contributors. Return every known field even if others are unavailable. Unidentified means no title could be recovered.\n" + json.dumps(schema)
     else:
-        prompt += "\nReturn exactly Title - Author(s) (YYYY|NA) [ISBN|NA], or NA if title or contributors are unknown."
+        prompt += "\nReturn exactly Title - Author(s) (YYYY|NA) [ISBN|NA]. Use NA for every missing field, including authors; recover missing metadata from the source filename when possible."
     content = [{"type": "text", "text": prompt}]
     for path in images:
         mime = mimetypes.guess_type(path)[0] or "image/jpeg"
@@ -322,6 +374,7 @@ def payload(model, system, prompt, packet, images, mode="json_schema", temperatu
 
 
 def isbn_candidates(text, extension="", edition=None):
+    text = "".join("-" if unicodedata.category(c) == "Pd" else c for c in text if unicodedata.category(c) != "Cf")
     values = []
     # Limit matches to one line, with a separate following-line number allowed.
     pattern = r"(?im)\bISBN(?:[- ]?1[03])?(?:\s*\([^\n)]*\))?[ \t]*:?[ \t]*(?:\n[ \t]*)?([\dXx][\dXx -]{8,}[\dXx])"
@@ -329,10 +382,14 @@ def isbn_candidates(text, extension="", edition=None):
         value = isbn_normalize(m[1])
         if not isbn_valid(value):
             continue
-        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_start = m.start()
         line_end = text.find("\n", m.end())
-        line = text[line_start:line_end if line_end >= 0 else len(text)].lower()
-        digital = bool(re.search(r"epub|e-?book|electronic|digital|pdf", line))
+        end = line_end if line_end >= 0 else len(text)
+        next_isbn = re.search(r"(?i)\bISBN\b", text[m.end():end])
+        if next_isbn:
+            end = m.end() + next_isbn.start()
+        line = text[line_start:end].lower()
+        digital = bool(re.search(r"epub|e-?book|\bebk\b|electronic|digital|pdf", line))
         match_format = extension and extension in line
         score = (100 if match_format else 50 if digital and extension in ("pdf", "epub", "mobi", "chm") else 0) + (10 if len(value) == 13 else 0)
         if edition:
@@ -350,7 +407,12 @@ def identity_evidence(packet):
         return packet
     match = re.search(r"(?m)^Front-matter page limit: (\d+)$", packet)
     front_pages = int(match[1]) if match else 14
-    relevant = sources_in(packet.split("=== END OF SAMPLED TEXT ===", 1)[0])
+    # Prefer complete opening-page excerpts over repeated, overlapping clue
+    # fragments from the same page (especially translated-edition copyright).
+    opening, _, clues = packet.split("=== END OF SAMPLED TEXT ===", 1)[0].partition("=== BIBLIOGRAPHIC CLUES ===")
+    relevant = sources_in(opening)
+    for sid, text in sources_in(clues).items():
+        relevant.setdefault(sid, text)
     return "\n".join(text for sid, text in relevant.items()
                      if sid.startswith("EPUB_") or sid.startswith("TEXT_P") and int(sid[6:]) <= front_pages)
 
@@ -359,15 +421,43 @@ def publication_years(text, edition=None):
     years = []
     edition_years = []
     release_years = []
-    for line in text.splitlines():
-        if re.search(r"(?i)copyright|©|\b(?:published|publication date|first release|edition)\b", line):
-            found = re.findall(r"(?<!\d)((?:1[5-9]|20|21)\d{2})(?!\d)", line)
-            years.extend(found)
-            if edition and edition_numbers(line) & edition_numbers(edition):
-                edition_years.extend(found)
-            if re.search(r"(?i)\b(?:published|publication date|first release)\b", line):
-                release_years.extend(found)
+    lines = text.splitlines()
+    year_pattern = r"\b(?:1[5-9]|20|21)\d{2}\b"
+    translated_source = False
+    for i, line in enumerate(lines):
+        if re.search(r"(?i)translation from|translated from|original .{0,30}(?:language|edition)", line):
+            translated_source = True
+        elif translated_source and re.match(r"\s*©", line):
+            translated_source = False
+        if translated_source:
+            continue
+        release = re.search(r"(?i)\b(?:published|publication date|first release)\s*(?:(?:in|on)\s+|:\s*)?(" + year_pattern + r")", line)
+        if release:
+            release_years.append(release[1])
+        if re.search(r"(?i)copyright|©", line):
+            # Copyright holders frequently wrap before the date. Stop after the
+            # first year-bearing line, rather than absorbing unrelated dates.
+            for continuation in lines[i:i + 4]:
+                found = re.findall(year_pattern, continuation)
+                if found:
+                    years.extend(found)
+                    break
+        if edition and edition_numbers(line) & edition_numbers(edition):
+            edition_years.extend(re.findall(year_pattern, line))
     return set(edition_years or release_years or years)
+
+
+def current_edition_text(text):
+    """Exclude credits for the earlier work from which a translation was made."""
+    result, translated_source = [], False
+    for line in text.splitlines():
+        if re.search(r"(?i)translation from|translated from|original .{0,30}(?:language|edition)", line):
+            translated_source = True
+        elif translated_source and re.match(r"\s*©", line):
+            translated_source = False
+        if not translated_source:
+            result.append(line)
+    return "\n".join(result)
 
 
 def name_supported(name, evidence):
@@ -394,16 +484,31 @@ def parse_metadata(data, packet, source_name, images, extension=""):
     for field in ("title", "original_title", "edition", "volume", "year", "isbn"):
         if data[field] is not None and not isinstance(data[field], str):
             raise ValueError(f"{field} must be a string or null")
-    if data["status"] == "unidentified":
-        raise ValueError("publication or required contributors could not be identified; inspect other supplied pages")
-    if not data["title"] or not data["authors"] or PLACEHOLDER.fullmatch(data["title"].strip()) or any(PLACEHOLDER.fullmatch(n.strip()) or not n.strip() for n in data["authors"]):
-        raise ValueError("missing or placeholder title/contributors")
     sources = sources_in(packet)
     sources["SOURCE_FILENAME"] = source_name
     visual = {image_id(p) for p in images}
     refs = data["sources"]
     if not isinstance(refs, dict) or set(refs) != set(FIELDS):
         raise ValueError("sources must cite each bibliographic field")
+    for field in FIELDS:
+        if not isinstance(refs[field], list) or any(not isinstance(ref, str) or ref not in sources and ref not in visual for ref in refs[field]):
+            raise ValueError(f"{field} cites an unknown evidence source")
+    fallback = source_metadata(source_name)
+    for field in ("title", "edition", "volume", "year", "isbn"):
+        if data[field] is not None and (not data[field].strip() or PLACEHOLDER.fullmatch(data[field].strip())):
+            data[field] = None
+        if not data[field]:
+            refs[field] = []
+    data["authors"] = [n.strip() for n in data["authors"] if n.strip() and not PLACEHOLDER.fullmatch(n.strip())]
+    if not data["title"]:
+        data["title"] = fallback["title"]
+        data["original_title"] = fallback["title"]
+        data["title_language"] = "en"
+        refs["title"] = ["SOURCE_FILENAME"] if data["title"] != "NA" else []
+    if not data["authors"]:
+        data["authors"] = fallback["authors"]
+        data["contributor_role"] = fallback["contributor_role"]
+        refs["authors"] = ["SOURCE_FILENAME"] if data["authors"] else []
     if data["volume"] and re.fullmatch(r"\d+|[ivxlcdm]+", data["volume"].strip(), re.I):
         data["volume"] = "Volume " + data["volume"].strip().upper()
     if data["edition"]:
@@ -423,55 +528,102 @@ def parse_metadata(data, packet, source_name, images, extension=""):
     for field in FIELDS:
         if not isinstance(refs[field], list) or any(not isinstance(ref, str) or ref not in sources and ref not in visual for ref in refs[field]):
             raise ValueError(f"{field} cites an unknown evidence source")
-        present = bool(data[field])
+        present = bool(data[field]) and data[field] != "NA"
         if present and not refs[field]:
             raise ValueError(f"{field} needs an evidence source")
         evidence = "\n".join(sources.get(ref, "") for ref in refs[field])
-        has_visual = any(ref in visual for ref in refs[field])
-        if field == "title":
+        # When an image's text layer is readable, use it to check the claim too.
+        # Images supplement unreadable/scanned regions, rather than overriding
+        # explicit machine-readable copyright and bibliographic data.
+        readable_visual = [sources.get("TEXT_P" + ref[7:], "") for ref in refs[field] if ref.startswith("IMAGE_P")]
+        evidence += "\n" + "\n".join(readable_visual)
+        has_visual = any(ref in visual and (not ref.startswith("IMAGE_P") or len(sources.get("TEXT_P" + ref[7:], "")) < 100) for ref in refs[field])
+        if field == "title" and present:
             def base_title(value):
                 return folded(VOLUME_RE.sub("", EDITION_RE.sub("", value)))
+            # A model can copy the whole filename into original_title while
+            # correctly extracting the title from the document. Prefer the
+            # supported document wording over that weaker filename credit.
+            document_refs = [sid for sid, text in sources.items() if sid != "SOURCE_FILENAME" and base_title(data["title"]) in folded(text)]
+            if data["title_language"] in ("en", "fr", "es") and document_refs and ("SOURCE_FILENAME" in refs[field] or not data["original_title"]):
+                data["original_title"] = data["title"]
+                refs[field] = document_refs[:2]
+                evidence = "\n".join(sources[ref] for ref in refs[field])
+                has_visual = False
+            elif data["original_title"] in (source_name, re.sub(r"(?i)\.(?:pdf|epub|mobi|chm)$", "", source_name)):
+                data["original_title"] = fallback["title"]
             # A redundant original_title may be omitted by a small model. Recover
             # it only when an unchanged English/French/Spanish title is in cited text.
             if data["original_title"] is None and data["title_language"] in ("en", "fr", "es") and base_title(data["title"]) in folded(evidence):
                 data["original_title"] = data["title"]
             if not data["original_title"]:
                 raise ValueError("original_title is missing; copy the verbatim publication title")
+            # Catalog records separate title and responsibility with a slash.
+            # Remove that credit only when a labelled catalog title establishes it.
+            catalog_title = re.search(r"(?ims)^\s*Title:\s*(.*?)\s+/\s+", evidence)
+            if catalog_title and folded(data["original_title"]).startswith(folded(catalog_title[1])):
+                data["original_title"] = re.split(r"\s+/\s+", data["original_title"], maxsplit=1)[0].strip()
             original = base_title(data["original_title"])
             if not original or not has_visual and original not in folded(evidence):
                 raise ValueError("original publication title is not present in cited evidence")
             if data["title_language"] in ("en", "fr", "es") and base_title(data["title"]) != original:
-                raise ValueError("English/French/Spanish title must preserve the original wording")
+                data["title"] = data["original_title"].strip()
         if field == "authors" and not has_visual and any(not name_supported(n, evidence) for n in data[field]):
             raise ValueError("contributor names are not present in cited text")
         if field == "year" and present:
             year = data[field]
+            preferred = publication_years(identity_evidence(packet), data["edition"])
+            if len(preferred) == 1 and year not in preferred:
+                year = data[field] = next(iter(preferred))
+                evidence += "\n" + identity_evidence(packet)
+                print(f"Metadata correction: publication year set to explicit document year {year}", file=sys.stderr)
             if not re.fullmatch(r"\d{4}", year):
-                raise ValueError("year must be four digits or null")
-            filename_year = re.search(r"\(" + re.escape(year) + r"\)\s*\[", source_name) or re.search(r"\s--\s.*\b" + re.escape(year) + r"\b", source_name)
+                print("Metadata correction: invalid publication year omitted", file=sys.stderr)
+                data[field] = None
+                refs[field] = []
+                continue
+            filename_year = fallback["year"] == year
             if not has_visual and year not in publication_years(evidence, data["edition"]) and not ("SOURCE_FILENAME" in refs[field] and filename_year):
-                raise ValueError("year lacks explicit publication/copyright/edition evidence")
+                print(f"Metadata correction: unsupported publication year omitted: {year}", file=sys.stderr)
+                data[field] = None
+                refs[field] = []
         if field == "isbn" and present:
             value = isbn_normalize(data[field])
             if not isbn_valid(value):
-                raise ValueError("ISBN checksum or prefix is invalid; reread the number, never invent digits")
+                ranked = isbn_candidates(identity_evidence(packet), extension, data["edition"])
+                best = [v for score, v in ranked if score == ranked[0][0]] if ranked else []
+                if len(best) == 1:
+                    value = best[0]
+                    evidence = packet
+                    print(f"Metadata correction: invalid model ISBN replaced with observed ISBN {value}", file=sys.stderr)
+                else:
+                    print("Metadata correction: invalid model ISBN omitted; no unambiguous valid identifier found", file=sys.stderr)
+                    data[field] = None
+                    refs[field] = []
+                    continue
             if not has_visual and value not in isbn_normalize(evidence):
                 raise ValueError("ISBN is not present in cited evidence")
             data[field] = value
         if field in ("edition", "volume") and present:
             markers = edition_numbers if field == "edition" else volume_numbers
             values = markers(data[field])
+            if field == "edition":
+                evidence = current_edition_text(evidence)
             if not values or not has_visual and not values.issubset(markers(evidence)):
-                raise ValueError(f"{field} is unsupported by cited text")
+                print(f"Metadata correction: unsupported {field} omitted: {data[field]}", file=sys.stderr)
+                pattern = EDITION_RE if field == "edition" else VOLUME_RE
+                data["title"] = pattern.sub("", data["title"]).strip(" ,;-")
+                data[field] = None
+                refs[field] = []
     title = data["title"].strip()
     for field in ("volume", "edition"):
         markers = edition_numbers if field == "edition" else volume_numbers
         if data[field] and not markers(data[field]).issubset(markers(title)):
             title += ", " + data[field].strip()
-    authors = ", ".join(n.strip() for n in data["authors"][:3])
+    authors = ", ".join(n.strip() for n in data["authors"][:3]) or "NA"
     if len(data["authors"]) > 3:
         authors += ", et al."
-    if data["contributor_role"] == "editor":
+    if data["authors"] and data["contributor_role"] == "editor":
         authors += " (Editor)" if len(data["authors"]) == 1 else " (Editors)"
     # Prefer an explicitly labelled identifier for the source format, not a print ISBN.
     isbn_evidence = "\n".join(sources.get(ref, "") for ref in refs["isbn"])
@@ -482,24 +634,41 @@ def parse_metadata(data, packet, source_name, images, extension=""):
         best = [v for score, v in ranked if score == ranked[0][0]]
         if len(best) == 1:
             isbn = best[0]
-    return f"{title} - {authors} ({data['year'] or 'NA'}) [{isbn}]"
+    return repair_candidate(f"{title} - {authors} ({data['year'] or 'NA'}) [{isbn}]", packet, extension, source_name)
 
 
-def repair_candidate(candidate, evidence, extension=""):
+def repair_candidate(candidate, evidence, extension="", source_name=""):
+    if candidate.strip() == "NA":
+        return source_candidate(source_name, evidence, extension)
     try:
         title, authors, year, isbn = filename_parts(candidate, partial=True)
     except ValueError:
         return candidate
     # Fill only missing fields. Consume existing terminal fields before rebuilding.
+    fallback = source_metadata(source_name)
+    if PLACEHOLDER.fullmatch(title):
+        title = fallback["title"]
+    if PLACEHOLDER.fullmatch(authors):
+        authors = ", ".join(fallback["authors"]) or "NA"
+        if fallback["authors"] and fallback["contributor_role"] == "editor":
+            authors += " (Editor)" if len(fallback["authors"]) == 1 else " (Editors)"
     evidence = identity_evidence(evidence)
     years = publication_years(evidence, title)
     ranked = [(score, value) for score, value in isbn_candidates(evidence, extension, title) if score >= 0]
     if year is None or year == "NA":
-        year = next(iter(years)) if len(years) == 1 else "NA"
+        year = next(iter(years)) if len(years) == 1 else (fallback["year"] if not years else None) or "NA"
     if isbn is None or isbn == "NA":
         best = [v for score, v in ranked if score == ranked[0][0]] if ranked else []
-        isbn = best[0] if len(best) == 1 else "NA"
+        isbn = best[0] if len(best) == 1 else (fallback["isbn"] if not best else None) or "NA"
     return f"{title} - {authors} ({year}) [{isbn}]"
+
+
+def useful_pdf_text(path, front_pages):
+    pages = clean_pages(Path(path).read_text(errors="replace"))
+    opening = [lines for sid, lines in pages if int(sid[6:]) <= front_pages]
+    text = "\n".join("\n".join(lines) for lines in opening)
+    return len(text) >= 500 and (bool(re.search(r"(?i)\bisbn\b|copyright|©", text)) or
+                                 len(text) >= 1000 and any(50 <= len("\n".join(lines)) <= 500 for lines in opening))
 
 
 def validate_evidence(candidate, packet, source_name, images):
@@ -507,13 +676,13 @@ def validate_evidence(candidate, packet, source_name, images):
     title, authors, year, isbn = validate_filename(candidate)
     text = packet + "\n" + source_name
     # Visual evidence is verified by extraction, rather than an independent OCR engine.
-    if not images:
+    if not images and authors != "NA":
         names = re.sub(r"(?i)\s*\((?:editor|editors)\)\s*$", "", authors)
         names = re.sub(r"(?i),?\s*et al\.?$", "", names)
         if any(not name_supported(n, text) for n in re.split(r",\s*|;\s*", names)):
             raise ValueError("contributor is not supported by source text or filename")
     years = publication_years(identity_evidence(packet), title)
-    filename_year = re.search(r"\(" + re.escape(year) + r"\)\s*\[", source_name)
+    filename_year = source_metadata(source_name)["year"] == year
     structured_year = " -- " in source_name and re.search(r"\b" + re.escape(year) + r"\b", source_name)
     if year != "NA" and not images and year not in years and (years or not (filename_year or structured_year)):
         raise ValueError("publication year is unsupported or conflicts with document evidence")
@@ -582,6 +751,7 @@ def record_metrics(path, source, candidate, outcome, elapsed, stats, images, mod
         try:
             title, authors, year, isbn = validate_filename(candidate)
             data.update(title=title, authors=authors, year=year, isbn=isbn,
+                        missing_metadata_fields=sum(value == "NA" for value in (title, authors, year, isbn)),
                         missing_optional_fields=int(year == "NA") + int(isbn == "NA"))
         except ValueError:
             data["invalid_candidate"] = True
@@ -591,7 +761,7 @@ def record_metrics(path, source, candidate, outcome, elapsed, stats, images, mod
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("evidence", "epub", "payload", "parse", "validate", "repair", "validate-evidence", "rank-pages", "backoff", "metrics", "server-info"))
+    parser.add_argument("command", choices=("evidence", "epub", "payload", "parse", "validate", "repair", "source", "useful-text", "validate-evidence", "rank-pages", "backoff", "metrics", "server-info"))
     parser.add_argument("args", nargs=argparse.REMAINDER)
     ns = parser.parse_args()
     a = ns.args
@@ -603,7 +773,11 @@ def main():
     elif ns.command == "validate":
         validate_filename(a[0])
     elif ns.command == "repair":
-        print(repair_candidate(a[0], a[1], a[2] if len(a) > 2 else ""))
+        print(repair_candidate(a[0], a[1], a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else ""))
+    elif ns.command == "source":
+        print(source_candidate(a[0], a[1], a[2]))
+    elif ns.command == "useful-text":
+        sys.exit(0 if useful_pdf_text(a[0], int(a[1])) else 1)
     elif ns.command == "validate-evidence":
         validate_evidence(a[0], a[1], a[2], a[3:])
     elif ns.command == "payload":

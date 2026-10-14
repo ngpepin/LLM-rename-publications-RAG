@@ -243,29 +243,30 @@ LLM_REASONING_EFFORT=""
 LLM_EXPECTED_CONTEXT_TOKENS=0
 LOG_MODEL_METADATA=false
 ENABLE_MULTIMODAL=true
+MULTIMODAL_TEXT_FIRST=true
 MULTIMODAL_INITIAL_IMAGES=3
 MULTIMODAL_MAX_IMAGES=3
-MULTIMODAL_SCAN_PAGES=8
+MULTIMODAL_SCAN_PAGES=14
 MULTIMODAL_IMAGE_DPI=110
 MULTIMODAL_NONWHITE_FRACTION=0.001
 ```
 
 `json_schema` requests constrained JSON with separate bibliographic fields, the original title/language, and evidence-source citations. The script verifies this contract on synthetic evidence before touching books. Use `json_object` explicitly for servers that support JSON mode but not schemas, or `text` for legacy endpoints; text mode still receives deterministic cleanup and factual checks. There is no critic phase. The old `ENABLE_CRITIC` setting has no effect.
 
-Title and credited contributors are required. Missing optional year/ISBN fields become `NA`; placeholders such as `Author(s)` are rejected. Contributor names, original titles, years, numbered editions, volumes, and ISBNs are checked against cited text where possible. ISBN-10/13 checksums and ISBN-13 prefixes are validated. Explicit format-labelled digital identifiers take precedence over print identifiers. Missing optional fields are filled deterministically only when evidence is unambiguous. Image citations remain model-derived evidence: this workflow does not independently OCR every visual claim.
+Incomplete metadata does not prevent renaming. Each missing title, contributor, year, or ISBN field becomes `NA` after attempting recovery from the current filename. Legacy contributor placeholders such as `(Author)` and `Author(s)` normalize to `NA`. For example, `Healing Joints and Nerves - (Author) (NA) [NA].pdf` becomes `Healing Joints and Nerves - NA (NA) [NA].pdf` when no additional metadata is available. Ordinary filenames provide a fallback title; filenames with recognizable bibliographic fields also provide contributors, dates, and valid ISBNs. Even files with no usable text or images receive a filename-based rename. Stronger document evidence wins over filename hints, and missing dates/ISBNs are filled from document evidence only when unambiguous. Contributor names, original titles, years, numbered editions, volumes, and ISBNs are checked against cited text where possible. ISBN-10/13 checksums and ISBN-13 prefixes are validated. Explicit format-labelled digital identifiers take precedence over print identifiers. Image citations remain model-derived evidence: this workflow does not independently OCR every visual claim.
 
-When multimodal mode is enabled, `pdftoppm` is required. PDF images are ranked using copyright, ISBN, edition, and contributor clues in the corresponding page text. Image-only scans use spread-out selections when text clues are unavailable. Images carry individual page IDs. `MULTIMODAL_INITIAL_IMAGES` controls the first request; identification retries can add images up to `MULTIMODAL_MAX_IMAGES`. The configured local setup starts with three and allows up to eight. Increasing the cap does not improve every book: compare accuracy and latency on a labelled set.
+When multimodal mode is enabled, `pdftoppm` is required. `MULTIMODAL_TEXT_FIRST=true` uses readable PDF front matter without images to preserve context and reduce visual guesses. Sparse or scanned PDFs still use images; set this option to `false` to always attach ranked PDF images. Images are ranked using copyright, ISBN, edition, and contributor clues in the corresponding page text. Image-only scans use spread-out selections when text clues are unavailable. Images carry individual page IDs. `MULTIMODAL_INITIAL_IMAGES` controls the first image request; identification retries can add images up to `MULTIMODAL_MAX_IMAGES`. The configured local setup starts with three and allows up to eight. Increasing the cap does not improve every book: compare accuracy and latency on a labelled set.
 
 EPUB OPF metadata and the first four spine resources are read directly. Declared cover and front-matter images are preferred without rendering a temporary PDF. If suitable native images are unavailable, EPUB, MOBI, and CHM can use temporary-PDF rendering. Rendering uses the matching PDF text to rank pages.
 
-Text evidence has independent native, front-matter, bibliographic-clue, and tail budgets, with page IDs and neighboring lines around metadata matches. These settings control its size:
+Text evidence has independent native, front-matter, bibliographic-clue, and tail budgets, with page IDs and neighboring lines around metadata matches. Complete copyright and editor/title pages take precedence over long blurbs and contents. When opening pages provide bibliographic data, distant chapter references are excluded from the clue packet. Tail evidence is opt-in. Source citations are limited to two decisive pages per field. Unsupported model editions/volumes and dates are omitted; unambiguous document dates and checksum-valid ISBNs can correct model output while retaining supported contributors. Earlier original-language edition credits are excluded when identifying a translation. These settings control its size:
 
 ```bash
 EXTRACT_SENT_TO_LLM_LENGTH=12000
 LLM_HEAD_LINES=240
 LLM_METADATA_LINES=160
-LLM_TAIL_LINES=100
-LLM_CONTEXT_CHARS=18000
+LLM_TAIL_LINES=0
+LLM_CONTEXT_CHARS=10000
 ```
 
 The character budget excludes prompt/schema instructions and visual tokens. `LLM_EXPECTED_CONTEXT_TOKENS` is an advisory threshold checked against reported prompt usage plus the output budget; it does **not** configure the server. For Ollama, set effective context using `PARAMETER num_ctx` in a model's Modelfile, then use that model name. `LLM_REASONING_EFFORT` is omitted when empty so the model template controls thinking; use a supported value only when the endpoint/model accepts it. `LLM_SEED` is optional and does not guarantee cross-version reproducibility. See [Ollama API compatibility](https://docs.ollama.com/api/openai-compatibility) and [structured outputs](https://docs.ollama.com/capabilities/structured-outputs).

@@ -33,6 +33,8 @@ The original extension is retained unless the workflow intentionally converts th
 
 Important normalization rules:
 
+- Missing title, contributor, year, or ISBN metadata must not cause skipping. Recover recognizable fields from the current filename, preferring stronger document evidence, and use `NA` for any remaining missing fields. Legacy author placeholders such as `(Author)` normalize to `NA`.
+
 - The author boundary is the final bibliographic ` - ` separator.
 - Never use `by` to introduce the author in the canonical filename.
 - Cover-style terminal credits such as `... by Jane Smith (2024) [ISBN]` must normalize to `... - Jane Smith (2024) [ISBN]`.
@@ -127,6 +129,7 @@ Important settings include:
 - `LLM_EXPECTED_CONTEXT_TOKENS` (advisory; actual context belongs to the server)
 - `LOG_MODEL_METADATA`
 - `ENABLE_MULTIMODAL`
+- `MULTIMODAL_TEXT_FIRST`
 - `MULTIMODAL_MAX_IMAGES`
 - `MULTIMODAL_INITIAL_IMAGES`
 - `MULTIMODAL_SCAN_PAGES`
